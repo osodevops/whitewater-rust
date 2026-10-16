@@ -1,0 +1,24 @@
+[package]
+name = "whitewater"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Typed application client for the Whitewater wire protocol — Feeds, Readers, Subscriptions, StateStores, Indexes, Pipes, and demand observability"
+license = "Apache-2.0"
+repository = "https://github.com/osodevops/whitewater-rust"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }

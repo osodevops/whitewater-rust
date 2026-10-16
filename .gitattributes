@@ -1,0 +1,5 @@
+# Keep LF in the working tree so rustfmt agrees on every OS (Windows
+# runners check out with core.autocrlf=true otherwise).
+*.rs   text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
