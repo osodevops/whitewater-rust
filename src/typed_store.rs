@@ -147,6 +147,25 @@ impl<K, V> Store<K, V> {
         })
     }
 
+    /// The decoded value for `key`, `None` when absent — `get` without
+    /// the row/freshness wrapper.
+    pub async fn find(&self, key: &K) -> Result<Option<V>, SdkError> {
+        Ok(self.get(key, false).await?.row.map(|row| row.value))
+    }
+
+    /// The first row whose declared `named_key` posting equals `value`,
+    /// decoded — `get_by` for the fallback-lookup shape.
+    pub async fn find_by(&self, named_key: &str, value: TypedValue) -> Result<Option<V>, SdkError> {
+        let page = self.get_by(named_key, &[value], Some(1), false).await?;
+        Ok(page.rows.into_iter().next().map(|row| row.value))
+    }
+
+    /// `find` with a caller fallback — counters and simple reads stay
+    /// one line: `store.get_or_default(&key, 0).await? + 1`.
+    pub async fn get_or_default(&self, key: &K, default: V) -> Result<V, SdkError> {
+        Ok(self.find(key).await?.unwrap_or(default))
+    }
+
     /// Primary-key ordered page of decoded rows; `after_key` continues
     /// from a prior page's `next_key`, `None` starts at the first row.
     /// The continuation key round-trips through the key codec so callers

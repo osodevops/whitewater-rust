@@ -42,6 +42,7 @@
 
 mod client;
 mod codec;
+mod consumer;
 mod demand;
 mod error;
 mod feed;
@@ -57,6 +58,7 @@ mod writer;
 
 pub use client::Client;
 pub use codec::Codec;
+pub use consumer::{ConsumerHandle, FeedConsumer, ReaderStart};
 pub use demand::{DemandReport, DemandRow, HotKey};
 pub use error::SdkError;
 pub use feed::{

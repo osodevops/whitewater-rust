@@ -287,12 +287,24 @@ impl Subscription {
 /// A codec-bound declared Feed. `Client::feed` binds the default
 /// utf8-key/bytes-payload codecs; `Client::feed_with` binds explicit
 /// codecs; `view` rebinds without a wire call.
-#[derive(Clone)]
 pub struct Feed<K, V> {
     pub(crate) client: Client,
     pub(crate) name: String,
     pub(crate) key_codec: Codec<K>,
     pub(crate) value_codec: Codec<V>,
+}
+
+// Manual Clone so the codecs' unbounded Clone carries through —
+/// K/V need no Clone bound themselves.
+impl<K, V> Clone for Feed<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            name: self.name.clone(),
+            key_codec: self.key_codec.clone(),
+            value_codec: self.value_codec.clone(),
+        }
+    }
 }
 
 impl<K, V> Feed<K, V> {
@@ -345,9 +357,20 @@ impl<K, V> Feed<K, V> {
         reader_name: &str,
         capacity: u64,
     ) -> Result<FeedReader<K, V>, SdkError> {
+        self.open_reader(reader_name, capacity, "BEGINNING").await
+    }
+
+    /// Declare the Reader at `start_wcl` when missing, then open — the
+    /// [`FeedConsumer`](crate::consumer::FeedConsumer) seam.
+    pub(crate) async fn open_reader(
+        &self,
+        reader_name: &str,
+        capacity: u64,
+        start_wcl: &str,
+    ) -> Result<FeedReader<K, V>, SdkError> {
         self.client
             .create_resource_tolerating_exists(&format!(
-                "CREATE READER {reader_name} FROM {} START AT BEGINNING",
+                "CREATE READER {reader_name} FROM {} START AT {start_wcl}",
                 self.name
             ))
             .await?;
@@ -357,6 +380,26 @@ impl<K, V> Feed<K, V> {
             key_codec: self.key_codec.clone(),
             value_codec: self.value_codec.clone(),
         })
+    }
+
+    /// A permanent, supervised consumer bound to this Feed's named
+    /// Reader — pull decoded records via
+    /// [`FeedConsumer::next`](crate::consumer::FeedConsumer::next) or a
+    /// per-record `run` handler; open/fetch/ack/reopen/backoff stay
+    /// inside the SDK. See [`crate::consumer`].
+    ///
+    /// ```ignore
+    /// let mut consumer = feed.consumer("enricher");
+    /// while let Some(message) = consumer.next().await? {
+    ///     process(&message).await;
+    /// }
+    /// ```
+    pub fn consumer(&self, reader_name: &str) -> crate::consumer::FeedConsumer<K, V>
+    where
+        K: Send + 'static,
+        V: Send + 'static,
+    {
+        crate::consumer::FeedConsumer::new(self.clone(), reader_name)
     }
 
     /// Read one page straight off the Feed: `after` resumes from an

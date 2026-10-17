@@ -83,6 +83,54 @@ remains the explicit escape hatch and carries the full wire contract —
 nanosecond timestamps as `i64`, opaque cursors, record Metadata as raw
 bytes.
 
+## Permanent consumer: `feed.consumer()` — supervision inside
+
+For the Kafka-style "consume forever" loop, `feed.consumer(reader)`
+wraps the Reader lifecycle in a supervisor — session re-opens,
+transient backoff, graceful drain are all internal. Application code
+only sees decoded records, one at a time:
+
+```rust
+let mut consumer = feed.consumer("enricher");
+while let Some(message) = consumer.next().await? {
+    process(&message).await;      // Err -> the page stays unacked and
+}                                 //         redelivers (at-least-once)
+
+// Or a handler form completing only on close/stop:
+let stop = consumer.handle();      // call stop() from a signal task
+feed.consumer("enricher")
+    .start_at(ReaderStart::Beginning)          // first declaration only
+    .backoff(Duration::from_millis(250), Duration::from_secs(30))
+    .on_error(|e| eprintln!("consumer restarted: {e}"))
+    .run(|msg| async move { process(msg).await?; Ok(()) })
+    .await?;
+```
+
+- The named Reader's acknowledged cursor is durable server-side — a
+  service restart resumes where it stopped; no offset management.
+- Each fetched page is delivered record-by-record; its delivered
+  cursor acks only after every record delivered cleanly. A handler
+  error (or an abandoned consumer) leaves the page unacked, so it
+  redelivers — route poison pills to a DLQ feed yourself.
+- Transient failures (`Unavailable`, `Ambiguous`, `Transport`) retry
+  with exponential backoff; a fenced session (`StaleEpoch`,
+  `Conflict`) re-opens and resumes. `Refused` and local codec/protocol
+  faults surface on `next`/`run` — fail fast, never loop.
+- `consumer.close().await` (or `handle.stop()`) finishes the
+  in-flight page, acks it, releases the session — the SIGTERM path.
+
+See [examples/enrich_users.rs](examples/enrich_users.rs) for the full
+enrichment service — primary/named-key store lookups, DLQ, counters.
+
+Value-level store lookups skip the row/freshness wrapper when it does
+not matter:
+
+```rust
+let profile = profiles.find(&email).await?
+    .or(profiles.find_by("user_id", TypedValue::Text(uid)).await?);
+let n = counters.get_or_default(&bucket, 0).await?;   // counters, one line
+```
+
 ## Observability
 
 `client.demand_feeds()` et al. return `DemandReport` — per-resource
@@ -122,10 +170,12 @@ src/
   demand.rs       demand counters + hot-Key evidence
   codec.rs        Codec<T> — utf8 / bytes / json / custom
   feed.rs         Feed<K,V>, FeedWriter, FeedReader, subscribe
+  consumer.rs     FeedConsumer — supervised next()/run() + ReaderStart
   typed_store.rs  Store<K,V>
   error.rs        SdkError + wire status/code mapping
   transport.rs    Transport trait + HttpTransport (reqwest/rustls)
   model.rs        Record/AppendOutcome/pages + wire decoders
 examples/
   typed_feed.rs   end-to-end typed write/read against a dev Node
+  enrich_users.rs permanent consumer: store lookup, DLQ, counters
 ```
