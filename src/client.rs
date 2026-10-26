@@ -362,13 +362,14 @@ impl Client {
         self.state_store(name)
     }
 
-    /// Codec-bound declared StateStore: utf8 keys, raw byte payloads —
-    /// the cross-SDK default binding.
-    pub fn store(&self, name: &str) -> Store<String, Vec<u8>> {
+    /// Codec-bound declared StateStore: UTF-8 strings both ways —
+    /// plain JSON flows with no codec ceremony; [`store_with`] with
+    /// [`Codec::bytes`] opts into raw binary.
+    pub fn store(&self, name: &str) -> Store<String, String> {
         Store {
             inner: self.state_store(name),
             key_codec: Codec::utf8(),
-            value_codec: Codec::bytes(),
+            value_codec: Codec::utf8(),
         }
     }
 
@@ -386,14 +387,16 @@ impl Client {
         }
     }
 
-    /// Codec-bound declared Feed: utf8 keys, raw byte payloads — the
-    /// cross-SDK default binding.
-    pub fn feed(&self, name: &str) -> Feed<String, Vec<u8>> {
+    /// Codec-bound declared Feed: UTF-8 strings both ways —
+    /// un-schema-backed JSON flows with zero codec ceremony;
+    /// [`feed_with`] with [`Codec::bytes`] is the escape hatch to raw
+    /// bytes.
+    pub fn feed(&self, name: &str) -> Feed<String, String> {
         Feed {
             client: self.clone(),
             name: name.to_owned(),
             key_codec: Codec::utf8(),
-            value_codec: Codec::bytes(),
+            value_codec: Codec::utf8(),
         }
     }
 
@@ -528,7 +531,7 @@ impl Client {
         &self,
         domain: &Domain,
         feed: &str,
-    ) -> Result<ReaderBuilder<String, Vec<u8>>, SdkError> {
+    ) -> Result<ReaderBuilder<String, String>, SdkError> {
         self.create_reader(domain, &domain.feed(feed)?)
     }
 
@@ -550,12 +553,12 @@ impl Client {
     }
 
     /// [`Client::create_writer`] taking a feed name relative to
-    /// `domain` with UTF-8 keys and byte payloads.
+    /// `domain` with UTF-8 string keys and payloads.
     pub fn create_writer_named(
         &self,
         domain: &Domain,
         feed: &str,
-    ) -> Result<WriterBuilder<String, Vec<u8>>, SdkError> {
+    ) -> Result<WriterBuilder<String, String>, SdkError> {
         self.create_writer(domain, &domain.feed(feed)?)
     }
 

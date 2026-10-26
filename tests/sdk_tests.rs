@@ -639,7 +639,7 @@ async fn feed_writer_append_event_pins_identity_time_and_metadata() {
     let request_id = Uuid::new_v4();
     let outcome = writer
         .append_event(
-            FeedEvent::new("order-9".to_owned(), b"created".to_vec())
+            FeedEvent::new("order-9".to_owned(), "created".to_owned())
                 .with_request_id(request_id)
                 .with_event_time_ns(1_700_000_000_000_000_001),
         )
@@ -669,7 +669,7 @@ async fn feed_writer_keyless_event_sends_an_empty_key() {
     let feed = client.feed("orders.events");
     let writer = feed.writer("checkout").await.unwrap();
     writer
-        .append_event(FeedEvent::keyless(b"heartbeat".to_vec()))
+        .append_event(FeedEvent::keyless("heartbeat".to_owned()))
         .await
         .unwrap();
     let requests = transport.take_requests();
@@ -693,8 +693,8 @@ async fn feed_writer_batch_encodes_each_record() {
     let writer = feed.writer("checkout").await.unwrap();
     let outcomes = writer
         .append_batch(&[
-            FeedEvent::new("a".to_owned(), b"1".to_vec()),
-            FeedEvent::new("b".to_owned(), b"2".to_vec()),
+            FeedEvent::new("a".to_owned(), "1".to_owned()),
+            FeedEvent::new("b".to_owned(), "2".to_owned()),
         ])
         .await
         .unwrap();
@@ -814,7 +814,7 @@ async fn feed_records_decode_and_preserve_envelope_fields() {
     assert_eq!(records.len(), 1);
     let message = &records[0];
     assert_eq!(message.key.as_deref(), Some("k"));
-    assert_eq!(message.value, b"v");
+    assert_eq!(message.value, "v");
     assert_eq!(message.cursor.as_deref(), Some("opaque-cursor"));
     assert_eq!(message.event_time_ns, 1_700_000_000_000_000_001);
     assert_eq!(message.metadata_text("source").as_deref(), Some("test"));
@@ -979,7 +979,7 @@ async fn store_get_decodes_rows_and_passes_freshness_through() {
     let lookup = store.get(&"acct-1".to_owned(), true).await.unwrap();
     let row = lookup.row.expect("row found");
     assert_eq!(row.key, "acct-1");
-    assert_eq!(row.value, b"p");
+    assert_eq!(row.value, "p");
     assert_eq!(lookup.freshness.applied_seq, 9);
     assert_eq!(lookup.freshness.served_by, "node-3");
 }

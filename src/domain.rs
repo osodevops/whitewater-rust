@@ -160,7 +160,7 @@ impl Domain {
     /// Every Feed in this Domain as typed [`Feed`] handles bound to
     /// UTF-8 keys and byte payloads, sorted by name. Materializes the
     /// snapshot.
-    pub async fn feeds(&self) -> Result<Vec<Feed<String, Vec<u8>>>, SdkError> {
+    pub async fn feeds(&self) -> Result<Vec<Feed<String, String>>, SdkError> {
         self.feeds_prefixed(None).await
     }
 
@@ -170,13 +170,13 @@ impl Domain {
     pub async fn feeds_prefixed(
         &self,
         prefix: Option<&str>,
-    ) -> Result<Vec<Feed<String, Vec<u8>>>, SdkError> {
+    ) -> Result<Vec<Feed<String, String>>, SdkError> {
         let snap = self.snap().await?;
         Ok(snap
             .feeds
             .iter()
             .filter(|full| prefix.is_none_or(|p| relative(&self.name, full).starts_with(p)))
-            .map(|full| self.client.feed_with(full, Codec::utf8(), Codec::bytes()))
+            .map(|full| self.client.feed_with(full, Codec::utf8(), Codec::utf8()))
             .collect())
     }
 
@@ -229,8 +229,8 @@ impl Domain {
     /// `shop.feed("orders")` binds `shop.orders`. An already-qualified
     /// name (`"shop.orders"`) is accepted; every result lives under the
     /// Domain's prefix by construction. Pure name composition — no I/O.
-    pub fn feed(&self, relative: &str) -> Result<Feed<String, Vec<u8>>, SdkError> {
-        self.feed_with(relative, Codec::utf8(), Codec::bytes())
+    pub fn feed(&self, relative: &str) -> Result<Feed<String, String>, SdkError> {
+        self.feed_with(relative, Codec::utf8(), Codec::utf8())
     }
 
     /// [`Domain::feed`] with explicit key/value codecs — JSON payloads
@@ -248,7 +248,7 @@ impl Domain {
 
     /// [`Domain::feed`] after verifying the Feed is declared in the
     /// catalog. Materializes the snapshot.
-    pub async fn get_feed(&self, relative: &str) -> Result<Feed<String, Vec<u8>>, SdkError> {
+    pub async fn get_feed(&self, relative: &str) -> Result<Feed<String, String>, SdkError> {
         let full = self.resolve(relative)?;
         if !self.snap().await?.feeds.iter().any(|feed| feed == &full) {
             return Err(SdkError::Refused(format!(
@@ -589,8 +589,8 @@ pub trait IntoDomainFeed<K, V> {
     fn into_feed(self, domain: &Domain) -> Result<Feed<K, V>, SdkError>;
 }
 
-impl IntoDomainFeed<String, Vec<u8>> for &str {
-    fn into_feed(self, domain: &Domain) -> Result<Feed<String, Vec<u8>>, SdkError> {
+impl IntoDomainFeed<String, String> for &str {
+    fn into_feed(self, domain: &Domain) -> Result<Feed<String, String>, SdkError> {
         domain.feed(self)
     }
 }

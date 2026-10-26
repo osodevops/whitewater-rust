@@ -9,7 +9,7 @@
 
 use std::env;
 
-use whitewater::{Client, Codec, ReaderStart};
+use whitewater::{Client, ReaderStart};
 
 #[tokio::main]
 async fn main() -> Result<(), whitewater::SdkError> {
@@ -42,8 +42,9 @@ async fn main() -> Result<(), whitewater::SdkError> {
     println!("domain id: {}", shop.domain_id().await?);
     println!("feeds:     {:?}", shop.feed_names().await?);
 
-    // Codec-bound typed handle — pure name composition, zero I/O.
-    let orders = shop.feed_with("orders", Codec::utf8(), Codec::<String>::utf8())?;
+    // Codec-bound typed handle — Feed<String,String> (UTF-8) by
+    // default; feed_with(..) rebinds. Pure name composition, zero I/O.
+    let orders = shop.feed("orders")?;
 
     // Builders hang off the Domain — a typed Feed handle keeps its
     // codecs (client.create_writer(&shop, &orders)), while the

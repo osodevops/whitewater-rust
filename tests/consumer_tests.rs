@@ -198,7 +198,7 @@ async fn next_delivers_each_record_and_acks_the_page() {
 
     let mut seen = Vec::new();
     while let Some(message) = consumer.next().await.expect("next") {
-        seen.push(String::from_utf8(message.value).unwrap());
+        seen.push(message.value);
         if seen.len() == 2 {
             break;
         }
@@ -241,7 +241,7 @@ async fn run_handler_failure_skips_ack_and_redelivers() {
             let stop = stop.clone();
             let attempts = handler_attempts.clone();
             async move {
-                assert_eq!(b"alpha", message.value.as_slice());
+                assert_eq!("alpha", message.value);
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(SdkError::Codec("transient handler bug".to_owned()));
                 }
@@ -283,7 +283,7 @@ async fn stale_session_reopens_and_resumes() {
         .run(move |message| {
             let stop = stop.clone();
             async move {
-                assert_eq!(b"alpha", message.value.as_slice());
+                assert_eq!("alpha", message.value);
                 stop.stop();
                 Ok(())
             }

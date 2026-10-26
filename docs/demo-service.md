@@ -8,7 +8,7 @@ The contract in one line: **`Ok(true)` = processed, `Err` = replay** —
 the SDK acks a page only after every record in it has been handled.
 
 ```rust
-use whitewater::{Client, Codec, ReaderStart, SdkError};
+use whitewater::{Client, ReaderStart, SdkError};
 
 #[tokio::main]
 async fn main() -> Result<(), SdkError> {
@@ -25,7 +25,7 @@ async fn main() -> Result<(), SdkError> {
 
     // ---- produce (usually a different service) -----------------------
     // Bind codecs on the Feed handle — the SDK serializes, no byte plumbing.
-    let orders = shop.feed_with("orders", Codec::utf8(), Codec::<String>::json())?;
+    let orders = shop.feed("orders")?;   // Feed<String,String> — UTF-8 by default
     let writer = shop
         .create_writer(&orders)?
         .writer_id("orders.ingest")
@@ -34,7 +34,7 @@ async fn main() -> Result<(), SdkError> {
     writer.append(&"order-1".to_owned(), &"{\"total\":42}".to_owned()).await?;
 
     // ---- consume -----------------------------------------------------
-    let dlq = shop.feed_with("orders.dlq", Codec::utf8(), Codec::<String>::json())?;
+    let dlq = shop.feed("orders.dlq")?;
     let dead_letter = shop
         .create_writer(&dlq)?
         .writer_id("fulfillment.dlq")

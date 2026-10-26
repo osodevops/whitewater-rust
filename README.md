@@ -47,7 +47,7 @@ async fn main() -> Result<(), whitewater::SdkError> {
     // Everything a service needs hangs off the Domain — relative
     // names resolve inside it.
     let writer = shop
-        .create_writer("orders")?            // utf8 keys / byte payloads
+        .create_writer(&orders)?             // &Feed<K,V> keeps its codecs
         .writer_id("checkout")
         .open()
         .await?;
@@ -55,12 +55,12 @@ async fn main() -> Result<(), whitewater::SdkError> {
         id: "o-1".to_owned(),
         total: 4200,
     }).await?;
-    // typed feeds: client.create_writer(&shop, &orders)? takes &Feed<K,V>
+    // name form works too: shop.create_writer("orders")? binds utf8 strings
 
     // ReaderBuilder: durable consume identity (the Kafka groupId
     // analogue) plus a first-time start position.
     let mut reader = shop
-        .create_reader("orders")?
+        .create_reader(&orders)?
         .reader_id("audit")
         .reader_start_point(ReaderStart::Beginning)
         .max_page_size(64)
