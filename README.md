@@ -204,6 +204,33 @@ let profile = profiles.find(&email).await?
 let n = counters.get_or_default(&bucket, 0).await?;   // counters, one line
 ```
 
+## API surface
+
+Everything the SDK exposes, grouped by capability. The typed surface
+(`Domain` → `Feed` → writer/reader/consumer) covers the daily path;
+`commands`, `wcl`, and the byte-level `Writer`/`Reader`/`StateStore`/
+`Member` types are the explicit escape hatches for the same wire
+contract.
+
+| Area | API |
+|---|---|
+| Client & transport | `Client::http(endpoints, api_key)` `Client::new` · `use_compression` `with_api_key` `wire` · `health` `check_compatible` `transport_limits` |
+| Typed Domains | `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` |
+| Schemas | `set_domain_schema` `set_feed_schema` `clear_domain_schema` `clear_feed_schema` · `Domain::schema` `feed_schema` `declared_feed_schema` · `SchemaDecl`/`FeedSchema` — `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`, `custom.<name>` |
+| Feeds | `feed(name)` / `feed_with(name, Codec, Codec)` → `Feed<K,V>` · `use_compression` · `records` `fetch` `load` · `writer` `append` `reader` `consumer` `subscribe` `view` |
+| Writing | `FeedWriter::append` `append_event` `append_batch` · `reopen` `session_epoch` · idempotent `request_id` · `FeedEvent` carries event time + Metadata |
+| Reading | `FeedReader::fetch` `ack` `close` · `session_epoch` `acknowledged_cursor` · durable `reader_id` · `ReaderStart` — `Beginning`, `Now`, `Cursor`, `TimestampNs` |
+| Temporary fetches | `client.temporary_fetch` / `Feed::fetch` — `after_event_time_ns` seeks, `new_only`, `tail` + `wait_ms` long-poll · `Feed::records` `Feed::load` |
+| Consumers | `feed.consumer(reader)` → `FeedConsumer`/`ConsumerHandle`: `start_at` `capacity` `backoff` `on_error` `handle` `next` `run` `stop` `wait` `close` |
+| Subscription members | `client.member(subscription)` → `Member`: `member_id` `member_epoch` `claim` `fetch` `ack` `renew` `release` — shared progress + RF3 work leases · `Feed::subscribe` managed loop |
+| StateStores | typed `store`/`store_with` → `Store<K,V>`: `put` `put_named` `get` `get_by` `find` `find_by` `get_or_default` `delete` `clear` `iterate` `sync` `rebuild` `view` `raw` · byte-level `state_store`/`state_store_raw` → `StateStore`: `put_row` `delete_row` `clear` `lookup` `get_by` `iterate` `sync` `rebuild` |
+| Indexes | `client.query_index(name, IndexQuery)` → `IndexPage` · `IndexBound` `IndexQuery` `TypedValue` |
+| Pipes | `client.pipe(name)` → `describe` `pause` `resume` `drop` · `client.pipes()` · declared via `commands` (`PipeInfo`) · durations are `std::time::Duration` |
+| Observability | `demand_feeds` `demand_readers` `demand_subscriptions` `demand_indexes` `demand_pipes` → `DemandReport`/`DemandRow::counter` · `hot_keys` → `HotKey` (`feed` `share_bps` `window_records` `window_bytes`) |
+| Escape hatches | `wcl(script)` · `commands(Vec<Value>)` raw command batch · `Writer`/`Reader`/`Member`/`StateStore` byte-level sessions |
+| Errors | `SdkError` — `Refused` `StaleEpoch` `Sequence` `LeaseBusy` `LeaseStale` `LeaseCapacity` `Conflict` `Ambiguous` `Unavailable` `IndexBehind` `IncompatibleServer` |
+| Testing | `Transport` trait seam — inject a scripted stub for the full client stack; see `tests/domain_tests.rs` for the pattern |
+
 ## Observability
 
 `client.demand_feeds()` et al. return `DemandReport` — per-resource
