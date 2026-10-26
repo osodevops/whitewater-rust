@@ -243,7 +243,7 @@ async fn reader_builder_declares_with_start_then_opens_a_session() {
         .unwrap()
         .reader_id("fulfillment")
         .reader_start_point(ReaderStart::Cursor("c1".to_owned()))
-        .capacity(64)
+        .max_page_size(64)
         .open()
         .await
         .unwrap();
@@ -583,7 +583,7 @@ async fn domain_scoped_builders_and_for_each_ack_per_page() {
         .unwrap()
         .reader_id("fulfillment")
         .reader_start_point(ReaderStart::Beginning)
-        .capacity(1)
+        .max_page_size(1)
         .open()
         .await
         .unwrap();

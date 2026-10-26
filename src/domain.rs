@@ -9,7 +9,7 @@
 //!     .create_reader(&shop, &shop.feed("orders"))?
 //!     .reader_id("fulfillment")                       // the Kafka groupId analogue
 //!     .reader_start_point(ReaderStart::Beginning)     // first-time start only
-//!     .capacity(256)
+//!     .max_page_size(256)
 //!     .open()
 //!     .await?;
 //! ```
@@ -31,7 +31,7 @@ use crate::consumer::ReaderStart;
 use crate::error::SdkError;
 use crate::feed::{Feed, FeedReader, FeedWriter};
 
-/// Default bounded fetch capacity for [`ReaderBuilder::open`].
+/// Default max page size for [`ReaderBuilder::open`].
 const DEFAULT_READER_CAPACITY: u64 = 128;
 
 /// One side of a Feed's schema metadata — format plus optional
@@ -409,7 +409,7 @@ pub struct ReaderBuilder<K, V> {
     feed: Feed<K, V>,
     reader_id: Option<String>,
     start: ReaderStart,
-    capacity: u64,
+    max_page_size: u64,
 }
 
 impl<K, V> ReaderBuilder<K, V> {
@@ -419,7 +419,7 @@ impl<K, V> ReaderBuilder<K, V> {
             feed,
             reader_id: None,
             start: ReaderStart::Beginning,
-            capacity: DEFAULT_READER_CAPACITY,
+            max_page_size: DEFAULT_READER_CAPACITY,
         }
     }
 
@@ -438,9 +438,9 @@ impl<K, V> ReaderBuilder<K, V> {
         self
     }
 
-    /// Bounded fetch page capacity — the default is 128.
-    pub fn capacity(mut self, capacity: u64) -> Self {
-        self.capacity = capacity;
+    /// Max records delivered per fetch page — the default is 128.
+    pub fn max_page_size(mut self, max_page_size: u64) -> Self {
+        self.max_page_size = max_page_size;
         self
     }
 
@@ -462,7 +462,7 @@ impl<K, V> ReaderBuilder<K, V> {
     /// codec-bound [`FeedReader`].
     pub async fn open(&self) -> Result<FeedReader<K, V>, SdkError> {
         self.feed
-            .open_reader(self.require_id()?, self.capacity, &self.start.wcl())
+            .open_reader(self.require_id()?, self.max_page_size, &self.start.wcl())
             .await
     }
 

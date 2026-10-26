@@ -64,7 +64,7 @@ async fn main() -> Result<(), whitewater::SdkError> {
         .create_reader("orders")?
         .reader_id("audit")
         .reader_start_point(ReaderStart::Beginning)
-        .capacity(64)
+        .max_page_size(64)
         .open()
         .await?;
     let page = reader.fetch(16).await?;

@@ -194,9 +194,9 @@ where
         self
     }
 
-    /// Records fetched per page (default 128).
-    pub fn capacity(mut self, capacity: u64) -> Self {
-        self.capacity = capacity.max(1);
+    /// Max records delivered per page (default 128).
+    pub fn max_page_size(mut self, max_page_size: u64) -> Self {
+        self.capacity = max_page_size.max(1);
         self.limit = self.capacity;
         self
     }
