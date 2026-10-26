@@ -8,7 +8,7 @@ The contract in one line: **`Ok(true)` = processed, `Err` = replay** —
 the SDK acks a page only after every record in it has been handled.
 
 ```rust
-use whitewater::{Client, ReaderStart, SdkError};
+use whitewater::{Client, Codec, ReaderStart, SdkError};
 
 #[tokio::main]
 async fn main() -> Result<(), SdkError> {
@@ -24,21 +24,24 @@ async fn main() -> Result<(), SdkError> {
     shop.create_feed("orders.dlq").await?;        // dead-letter feed
 
     // ---- produce (usually a different service) -----------------------
+    // Bind codecs on the Feed handle — the SDK serializes, no byte plumbing.
+    let orders = shop.feed_with("orders", Codec::utf8(), Codec::<String>::json())?;
     let writer = shop
-        .create_writer("orders")?
+        .create_writer(&orders)?
         .writer_id("orders.ingest")
         .open()
         .await?;
-    writer.append(&"order-1".to_owned(), &b"{\"total\":42}".to_vec()).await?;
+    writer.append(&"order-1".to_owned(), &"{\"total\":42}".to_owned()).await?;
 
     // ---- consume -----------------------------------------------------
+    let dlq = shop.feed_with("orders.dlq", Codec::utf8(), Codec::<String>::json())?;
     let dead_letter = shop
-        .create_writer("orders.dlq")?
+        .create_writer(&dlq)?
         .writer_id("fulfillment.dlq")
         .open()
         .await?;
     let mut reader = shop
-        .create_reader("orders")?
+        .create_reader(&orders)?
         .reader_id("fulfillment")                  // durable id — survives restarts
         .reader_start_point(ReaderStart::Beginning) // first-declare only
         .max_page_size(250)                        // max records per fetch page

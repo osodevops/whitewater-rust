@@ -616,3 +616,50 @@ async fn domain_scoped_builders_and_for_each_ack_per_page() {
     assert!(shop2.create_writer("BAD.NAME").is_err());
     assert!(transport2.take_requests().is_empty());
 }
+
+#[tokio::test]
+async fn domain_create_writer_accepts_a_codec_bound_feed() {
+    let (client, transport) = client(vec![
+        (200, json!({"results": [{}]})), // CREATE WRITER
+        (200, json!({"results": [{"data": {"session_epoch": 7}}]})), // open
+        (
+            200,
+            json!({
+                "message_id": "00000000-0000-0000-0000-000000000000",
+                "cursor": "cur-1",
+                "deduplicated": false
+            }),
+        ),
+    ]);
+    let shop = client.domain("shop").unwrap();
+    let orders = shop
+        .feed_with("orders", Codec::utf8(), Codec::<String>::utf8())
+        .unwrap();
+
+    // `&Feed<K,V>` passes straight through — the session's codecs are
+    // the feed's, so append takes String, never byte plumbing.
+    let writer = shop
+        .create_writer(&orders)
+        .unwrap()
+        .writer_id("ingest")
+        .open()
+        .await
+        .unwrap();
+    writer
+        .append(&"order-1".to_owned(), &"{\"total\":9}".to_owned())
+        .await
+        .unwrap();
+
+    let requests = transport.take_requests();
+    assert_eq!(
+        requests[0].2["script"],
+        "CREATE WRITER ingest TO shop.orders"
+    );
+    let b64 = base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    let (_, _, body) = requests
+        .iter()
+        .find(|(_, path, _)| path == "/v1/writers/append")
+        .expect("typed append hit the wire");
+    assert_eq!(body["payload_base64"], b64.encode("{\"total\":9}"));
+}

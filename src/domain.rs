@@ -281,21 +281,21 @@ impl Domain {
     /// ```
     ///
     /// [`Client::create_reader`] accepts the typed [`Feed`] handle.
-    pub fn create_reader(
+    pub fn create_reader<K, V>(
         &self,
-        relative: &str,
-    ) -> Result<ReaderBuilder<String, Vec<u8>>, SdkError> {
-        self.client.create_reader(self, &self.feed(relative)?)
+        feed: impl IntoDomainFeed<K, V>,
+    ) -> Result<ReaderBuilder<K, V>, SdkError> {
+        self.client.create_reader(self, &feed.into_feed(self)?)
     }
 
     /// Fluent Writer declaration on `relative` inside this Domain —
     /// `shop.create_writer("orders")` binds `shop.orders`.
     /// [`Client::create_writer`] accepts the typed [`Feed`] handle.
-    pub fn create_writer(
+    pub fn create_writer<K, V>(
         &self,
-        relative: &str,
-    ) -> Result<WriterBuilder<String, Vec<u8>>, SdkError> {
-        self.client.create_writer(self, &self.feed(relative)?)
+        feed: impl IntoDomainFeed<K, V>,
+    ) -> Result<WriterBuilder<K, V>, SdkError> {
+        self.client.create_writer(self, &feed.into_feed(self)?)
     }
 
     /// Resolve `relative` to a full dotted Feed name inside this Domain
@@ -576,5 +576,27 @@ fn dotted(name: &str) -> Result<String, SdkError> {
         Ok(name.to_owned())
     } else {
         Err(SdkError::Refused(format!("invalid dotted name: '{name}'")))
+    }
+}
+
+/// The argument accepted by [`Domain::create_reader`] and
+/// [`Domain::create_writer`]: either a `&str` relative/qualified Feed
+/// name resolved inside the Domain, or a borrowed codec-bound [`Feed`]
+/// handle passed straight through (its key/payload codecs become the
+/// session's codecs).
+pub trait IntoDomainFeed<K, V> {
+    /// Resolve `self` to a [`Feed`] handle inside `domain`.
+    fn into_feed(self, domain: &Domain) -> Result<Feed<K, V>, SdkError>;
+}
+
+impl IntoDomainFeed<String, Vec<u8>> for &str {
+    fn into_feed(self, domain: &Domain) -> Result<Feed<String, Vec<u8>>, SdkError> {
+        domain.feed(self)
+    }
+}
+
+impl<K, V> IntoDomainFeed<K, V> for &Feed<K, V> {
+    fn into_feed(self, _domain: &Domain) -> Result<Feed<K, V>, SdkError> {
+        Ok(self.clone())
     }
 }

@@ -61,7 +61,7 @@ pub use client::Client;
 pub use codec::Codec;
 pub use consumer::{ConsumerHandle, FeedConsumer, ReaderStart};
 pub use demand::{DemandReport, DemandRow, HotKey};
-pub use domain::{Domain, FeedSchema, ReaderBuilder, SchemaDecl, WriterBuilder};
+pub use domain::{Domain, FeedSchema, IntoDomainFeed, ReaderBuilder, SchemaDecl, WriterBuilder};
 pub use error::SdkError;
 pub use feed::{
     Feed, FeedEvent, FeedMessage, FeedPage, FeedReader, FeedReaderPage, FeedWriter, Subscription,
