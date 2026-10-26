@@ -18,6 +18,8 @@ boundary, and Cursors are opaque.
   rollups (`demand_feeds`, `demand_readers`, `demand_subscriptions`,
   `demand_indexes`, `demand_pipes`, `hot_keys`).
 
+A complete microservice walkthrough — provision, produce, pump-process, dead-letter, shutdown — lives in [`docs/demo-service.md`](docs/demo-service.md).
+
 ## Quick start
 
 ```rust
