@@ -21,7 +21,7 @@ boundary, and Cursors are opaque.
 ## Quick start
 
 ```rust
-use whitewater::{Client, Codec, FeedEvent, TemporaryFetch};
+use whitewater::{Client, Codec, FeedEvent, ReaderStart, TemporaryFetch};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Order { id: String, total: i64 }
@@ -33,22 +33,34 @@ async fn main() -> Result<(), whitewater::SdkError> {
         "whitewater-local-development-admin-key",
     )?;
 
-    // Bind codecs once: utf8 keys, JSON payloads.
-    let orders = client.feed_with(
-        "orders.events",
-        Codec::utf8(),
-        Codec::<Order>::json(),
-    );
+    // A Domain is the typed namespace that owns its feeds.
+    let shop = client.get_domain("shop").await?;
 
-    // Declares the Writer when missing and opens a fenced session.
-    let writer = orders.writer("checkout").await?;
+    // Typed feed handle — utf8 keys, JSON payloads — pure name
+    // composition, no I/O.
+    let orders = shop.feed_with("orders", Codec::utf8(), Codec::<Order>::json())?;
+
+    // WriterBuilder: durable produce identity, declares when missing,
+    // opens a fenced session.
+    let writer = client
+        .create_writer(&shop, &orders)?
+        .writer_id("checkout")
+        .open()
+        .await?;
     writer.append(&"order-1".to_owned(), &Order {
         id: "o-1".to_owned(),
         total: 4200,
     }).await?;
 
-    // Reader: decoded pages; ack commits durable progress.
-    let mut reader = orders.reader("audit", 64).await?;
+    // ReaderBuilder: durable consume identity (the Kafka groupId
+    // analogue) plus a first-time start position.
+    let mut reader = client
+        .create_reader(&shop, &orders)?
+        .reader_id("audit")
+        .reader_start_point(ReaderStart::Beginning)
+        .capacity(64)
+        .open()
+        .await?;
     let page = reader.fetch(16).await?;
     for message in &page.records {
         println!("{:?} -> {:?}", message.key, message.value.id);
@@ -58,6 +70,39 @@ async fn main() -> Result<(), whitewater::SdkError> {
     Ok(())
 }
 ```
+
+## Domains
+
+A `Domain` is the strongly-typed administrative namespace that owns
+every feed under its name prefix (`shop` owns `shop.orders`):
+
+```rust
+let shop = client.domain("shop")?;        // lazy handle — no I/O
+let shop = client.get_domain("shop").await?; // eager — verifies + loads
+```
+
+The first catalog accessor materializes one batched control read —
+`DESCRIBE DOMAIN` plus every `SHOW` listing — and caches it;
+`domain.refresh().await?` re-pulls. Scoped views:
+
+| Accessor | Contents |
+|---|---|
+| `domain_id()` / `describe()` | immutable id, status, history policy |
+| `feeds()` / `feeds_prefixed(..)` / `feed_names()` | feeds in this Domain |
+| `readers()` / `writers()` | named sessions on this Domain's feeds |
+| `subscriptions()` / `pipes()` / `indexes()` / `state_stores()` | scoped resources |
+
+`domain.feed("orders")` and `domain.feed_with(..)` are pure name
+composition — they never hit the network, and a name outside the Domain
+grammar is refused locally. `client.create_reader(&domain, &feed)` and
+`client.create_writer(&domain, &feed)` refuse a feed from another
+Domain before any wire call; `create_reader_named`/`create_writer_named`
+take relative names directly.
+
+Reader identity is durable — like Kafka's `groupId`: acknowledged
+progress survives restarts under the same `reader_id`.
+`reader_start_point(..)` applies only on first declaration; an existing
+Reader resumes its acknowledged frontier.
 
 ## Codecs
 

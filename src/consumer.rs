@@ -62,7 +62,7 @@ pub enum ReaderStart {
 }
 
 impl ReaderStart {
-    fn wcl(&self) -> String {
+    pub(crate) fn wcl(&self) -> String {
         match self {
             ReaderStart::Now => "NOW".to_owned(),
             ReaderStart::Cursor(cursor) => {

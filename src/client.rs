@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::codec::Codec;
+use crate::domain::{Domain, ReaderBuilder, WriterBuilder};
 use crate::error::{map_error, SdkError};
 use crate::feed::Feed;
 use crate::member::Member;
@@ -418,6 +419,84 @@ impl Client {
     /// drive the same typed commands WCL lowers to.
     pub fn pipe(&self, name: &str) -> Pipe {
         Pipe::new(self.clone(), name.to_owned())
+    }
+
+    /// A lazy [`Domain`] handle — no I/O until a catalog accessor is
+    /// awaited. `name` is validated locally against the dotted grammar.
+    pub fn domain(&self, name: &str) -> Result<Domain, SdkError> {
+        Domain::new(self.clone(), name)
+    }
+
+    /// An eager [`Domain`] handle — verifies the Domain exists and
+    /// materializes its catalog snapshot now.
+    pub async fn get_domain(&self, name: &str) -> Result<Domain, SdkError> {
+        let domain = self.domain(name)?;
+        domain.refresh().await?;
+        Ok(domain)
+    }
+
+    /// A fluent [`ReaderBuilder`] bound to `feed` — `feed` must belong
+    /// to `domain` (validated locally before any network call).
+    ///
+    /// ```ignore
+    /// let reader = client
+    ///     .create_reader(&shop, &shop.feed("orders")?)?
+    ///     .reader_id("fulfillment")
+    ///     .reader_start_point(ReaderStart::Beginning)
+    ///     .open()
+    ///     .await?;
+    /// ```
+    pub fn create_reader<K, V>(
+        &self,
+        domain: &Domain,
+        feed: &Feed<K, V>,
+    ) -> Result<ReaderBuilder<K, V>, SdkError> {
+        if !domain.owns(feed.name()) {
+            return Err(SdkError::Refused(format!(
+                "feed '{}' does not belong to domain '{}'",
+                feed.name(),
+                domain.name()
+            )));
+        }
+        Ok(ReaderBuilder::new(self.clone(), feed.clone()))
+    }
+
+    /// [`Client::create_reader`] taking a feed name relative to `domain`
+    /// (`"orders"` resolves to `shop.orders`) with UTF-8 keys and byte
+    /// payloads.
+    pub fn create_reader_named(
+        &self,
+        domain: &Domain,
+        feed: &str,
+    ) -> Result<ReaderBuilder<String, Vec<u8>>, SdkError> {
+        self.create_reader(domain, &domain.feed(feed)?)
+    }
+
+    /// A fluent [`WriterBuilder`] bound to `feed` — `feed` must belong
+    /// to `domain` (validated locally before any network call).
+    pub fn create_writer<K, V>(
+        &self,
+        domain: &Domain,
+        feed: &Feed<K, V>,
+    ) -> Result<WriterBuilder<K, V>, SdkError> {
+        if !domain.owns(feed.name()) {
+            return Err(SdkError::Refused(format!(
+                "feed '{}' does not belong to domain '{}'",
+                feed.name(),
+                domain.name()
+            )));
+        }
+        Ok(WriterBuilder::new(self.clone(), feed.clone()))
+    }
+
+    /// [`Client::create_writer`] taking a feed name relative to
+    /// `domain` with UTF-8 keys and byte payloads.
+    pub fn create_writer_named(
+        &self,
+        domain: &Domain,
+        feed: &str,
+    ) -> Result<WriterBuilder<String, Vec<u8>>, SdkError> {
+        self.create_writer(domain, &domain.feed(feed)?)
     }
 
     /// `SHOW PIPES` decoded as [`PipeInfo`] rows.
