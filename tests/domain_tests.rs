@@ -507,3 +507,27 @@ async fn set_and_clear_schema_emit_typed_commands() {
     assert_eq!(commands[2]["commands"][0]["command"], "clear_schema");
     assert_eq!(commands[2]["commands"][0]["scope"]["name"], "shop.orders");
 }
+
+/// `Domain::create_feed` composes the Domain prefix and issues the
+/// typed `CREATE FEED` WCL — a lazy Domain needs no catalog read first.
+#[tokio::test]
+async fn create_feed_composes_the_domain_prefix() {
+    let (client1, transport) = client(vec![(
+        200,
+        json!({ "revision": 3, "results": [{ "statement": "create", "message": "ok" }] }),
+    )]);
+    let shop = client1.domain("shop").expect("lazy domain");
+
+    shop.create_feed("orders").await.expect("create");
+
+    let requests = transport.take_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].1, "/v1/admin/wcl");
+    assert_eq!(requests[0].2["script"], "CREATE FEED shop.orders");
+
+    // Malformed names refuse before the wire.
+    let (client2, transport2) = client(vec![]);
+    let shop2 = client2.domain("shop").expect("lazy domain");
+    assert!(shop2.create_feed("BAD.NAME").await.is_err());
+    assert!(transport2.take_requests().is_empty());
+}

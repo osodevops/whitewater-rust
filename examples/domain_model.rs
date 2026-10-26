@@ -32,15 +32,13 @@ async fn main() -> Result<(), whitewater::SdkError> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    client
-        .wcl(&format!(
-            "CREATE DOMAIN {domain_name}; CREATE FEED {domain_name}.orders;"
-        ))
-        .await?;
+    client.wcl(&format!("CREATE DOMAIN {domain_name};")).await?;
 
     // get_domain verifies existence and materializes the catalog
-    // snapshot in one batched control read.
+    // snapshot in one batched control read; create_feed declares the
+    // feed inside the Domain's prefix.
     let shop = client.get_domain(&domain_name).await?;
+    shop.create_feed("orders").await?;
     println!("domain id: {}", shop.domain_id().await?);
     println!("feeds:     {:?}", shop.feed_names().await?);
 

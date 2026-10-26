@@ -259,6 +259,15 @@ impl Domain {
         self.feed(relative)
     }
 
+    /// `CREATE FEED` inside this Domain — `shop.create_feed("orders")`
+    /// declares `shop.orders`. [`Domain::refresh`] (or a lazy
+    /// accessor's first load) surfaces it through
+    /// [`Domain::feeds`]/[`Domain::feed_names`].
+    pub async fn create_feed(&self, relative: &str) -> Result<Vec<Value>, SdkError> {
+        let full = self.resolve(relative)?;
+        self.client.wcl(&format!("CREATE FEED {full}")).await
+    }
+
     /// Resolve `relative` to a full dotted Feed name inside this Domain
     /// — accepts the short form (`"orders"`) or the already-qualified
     /// form (`"shop.orders"`). A name that fails the dotted grammar is

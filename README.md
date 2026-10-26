@@ -34,7 +34,9 @@ async fn main() -> Result<(), whitewater::SdkError> {
     )?;
 
     // A Domain is the typed namespace that owns its feeds.
+    client.wcl("CREATE DOMAIN shop").await?;
     let shop = client.get_domain("shop").await?;
+    shop.create_feed("orders").await?;    // CREATE FEED shop.orders;
 
     // Typed feed handle — utf8 keys, JSON payloads — pure name
     // composition, no I/O.
@@ -79,6 +81,7 @@ every feed under its name prefix (`shop` owns `shop.orders`):
 ```rust
 let shop = client.domain("shop")?;        // lazy handle — no I/O
 let shop = client.get_domain("shop").await?; // eager — verifies + loads
+shop.create_feed("orders").await?;      // CREATE FEED shop.orders;
 ```
 
 The first catalog accessor materializes one batched control read —
@@ -92,6 +95,8 @@ The first catalog accessor materializes one batched control read —
 | `readers()` / `writers()` | named sessions on this Domain's feeds |
 | `subscriptions()` / `pipes()` / `indexes()` / `state_stores()` | scoped resources |
 
+`domain.create_feed("orders")` issues `CREATE FEED shop.orders` —
+the scoped companion of `client.wcl("CREATE FEED shop.orders")`.
 `domain.feed("orders")` and `domain.feed_with(..)` are pure name
 composition — they never hit the network, and a name outside the Domain
 grammar is refused locally. `client.create_reader(&domain, &feed)` and
@@ -215,7 +220,7 @@ contract.
 | Area | API |
 |---|---|
 | Client & transport | `Client::http(endpoints, api_key)` `Client::new` · `use_compression` `with_api_key` `wire` · `health` `check_compatible` `transport_limits` |
-| Typed Domains | `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` |
+| Typed Domains | `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` · `create_feed` |
 | Schemas | `set_domain_schema` `set_feed_schema` `clear_domain_schema` `clear_feed_schema` · `Domain::schema` `feed_schema` `declared_feed_schema` · `SchemaDecl`/`FeedSchema` — `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`, `custom.<name>` |
 | Feeds | `feed(name)` / `feed_with(name, Codec, Codec)` → `Feed<K,V>` · `use_compression` · `records` `fetch` `load` · `writer` `append` `reader` `consumer` `subscribe` `view` |
 | Writing | `FeedWriter::append` `append_event` `append_batch` · `reopen` `session_epoch` · idempotent `request_id` · `FeedEvent` carries event time + Metadata |
