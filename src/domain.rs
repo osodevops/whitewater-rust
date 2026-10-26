@@ -34,6 +34,45 @@ use crate::feed::{Feed, FeedReader, FeedWriter};
 /// Default bounded fetch capacity for [`ReaderBuilder::open`].
 const DEFAULT_READER_CAPACITY: u64 = 128;
 
+/// One side of a Feed's schema metadata — format plus optional
+/// subject/definition text. Formats: `text`, `json`, `protobuf`,
+/// `avro`, `custom.<name>`. Records stay schema-neutral bytes on the
+/// wire; declarations are catalog metadata for tooling and
+/// compatibility — not yet an enforced registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchemaDecl {
+    /// The declared format (`json`, `avro`, `custom.<name>`, …).
+    pub format: String,
+    /// Optional subject/version identity for tooling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Optional inline definition text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+/// The declared key/value schema pair — either side may be absent. A
+/// Feed's declaration overrides the named sides of its Domain default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FeedSchema {
+    /// The record-key schema, when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<SchemaDecl>,
+    /// The record-value schema, when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<SchemaDecl>,
+}
+
+impl FeedSchema {
+    fn from_wire(row: Option<&Value>) -> Option<Self> {
+        let parsed: FeedSchema = serde_json::from_value(row?.clone()).unwrap_or_default();
+        if parsed.key.is_none() && parsed.value.is_none() {
+            return None;
+        }
+        Some(parsed)
+    }
+}
+
 /// A strongly-typed handle on one Domain. Construct via
 /// [`Client::domain`] (lazy) or [`Client::get_domain`] (eager — verifies
 /// the Domain exists and loads the snapshot immediately).
@@ -49,6 +88,8 @@ struct Snapshot {
     domain_id: String,
     describe: Value,
     feeds: Vec<String>,
+    feed_schemas: std::collections::HashMap<String, Option<FeedSchema>>,
+    declared_schemas: std::collections::HashMap<String, Option<FeedSchema>>,
     readers: Vec<String>,
     writers: Vec<String>,
     subscriptions: Vec<String>,
@@ -81,6 +122,39 @@ impl Domain {
     /// `history_policy`, and friends.
     pub async fn describe(&self) -> Result<Value, SdkError> {
         Ok(self.snap().await?.describe.clone())
+    }
+
+    /// The Domain's declared schema default — `None` when undeclared.
+    /// Every Feed without its own declaration inherits it.
+    pub async fn schema(&self) -> Result<Option<FeedSchema>, SdkError> {
+        Ok(FeedSchema::from_wire(
+            self.snap().await?.describe.get("schema"),
+        ))
+    }
+
+    /// The effective schema for a Feed — its declared sides layered
+    /// over the Domain default. `None` when nothing is declared
+    /// anywhere (schema-neutral bytes).
+    pub async fn feed_schema(&self, feed: &str) -> Result<Option<FeedSchema>, SdkError> {
+        Ok(self
+            .snap()
+            .await?
+            .feed_schemas
+            .get(feed)
+            .cloned()
+            .unwrap_or(None))
+    }
+
+    /// Only the sides the Feed itself declares — `None` when it
+    /// inherits the Domain default wholesale.
+    pub async fn declared_feed_schema(&self, feed: &str) -> Result<Option<FeedSchema>, SdkError> {
+        Ok(self
+            .snap()
+            .await?
+            .declared_schemas
+            .get(feed)
+            .cloned()
+            .unwrap_or(None))
     }
 
     /// Every Feed in this Domain as typed [`Feed`] handles bound to
@@ -247,10 +321,18 @@ impl Domain {
 
         let mut feeds = Vec::new();
         let mut feed_ids = Vec::new();
+        let mut feed_schemas = std::collections::HashMap::new();
+        let mut declared_schemas = std::collections::HashMap::new();
         for row in rows(&results, 1) {
             if row.get("space_id").and_then(Value::as_str) == Some(domain_id.as_str()) {
                 if let Some(name) = row.get("name").and_then(Value::as_str) {
                     feeds.push(name.to_owned());
+                    feed_schemas.insert(
+                        name.to_owned(),
+                        FeedSchema::from_wire(row.get("effective_schema")),
+                    );
+                    declared_schemas
+                        .insert(name.to_owned(), FeedSchema::from_wire(row.get("schema")));
                 }
                 if let Some(feed_id) = row.get("feed_id").and_then(Value::as_str) {
                     feed_ids.push(feed_id.to_owned());
@@ -264,6 +346,8 @@ impl Domain {
             domain_id: domain_id.clone(),
             describe,
             feeds,
+            feed_schemas,
+            declared_schemas,
             readers: scoped(&results, 2, "feed_id", &feed_ids),
             writers: scoped(&results, 3, "feed_id", &feed_ids),
             subscriptions: scoped(&results, 4, "space_id", space_ids),

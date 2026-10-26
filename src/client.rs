@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::codec::Codec;
-use crate::domain::{Domain, ReaderBuilder, WriterBuilder};
+use crate::domain::{Domain, FeedSchema, ReaderBuilder, WriterBuilder};
 use crate::error::{map_error, SdkError};
 use crate::feed::Feed;
 use crate::member::Member;
@@ -446,6 +446,66 @@ impl Client {
     ///     .open()
     ///     .await?;
     /// ```
+    /// `set_domain_schema(domain, schema)` issues `SET SCHEMA ON
+    /// DOMAIN` — the Domain's inherited default.
+    pub async fn set_domain_schema(
+        &self,
+        domain: &str,
+        schema: &FeedSchema,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
+        self.set_schema("domain", domain, schema).await
+    }
+
+    /// `set_feed_schema(feed, schema)` issues `SET SCHEMA ON FEED` —
+    /// overrides the Domain's declared schema for the named sides.
+    pub async fn set_feed_schema(
+        &self,
+        feed: &str,
+        schema: &FeedSchema,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
+        self.set_schema("feed", feed, schema).await
+    }
+
+    /// `clear_domain_schema(domain)` issues `DROP SCHEMA ON DOMAIN`.
+    pub async fn clear_domain_schema(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
+        self.clear_schema("domain", domain).await
+    }
+
+    /// `clear_feed_schema(feed)` issues `DROP SCHEMA ON FEED` — the
+    /// Feed reverts to inheriting its Domain's declared schema.
+    pub async fn clear_feed_schema(&self, feed: &str) -> Result<Vec<serde_json::Value>, SdkError> {
+        self.clear_schema("feed", feed).await
+    }
+
+    async fn set_schema(
+        &self,
+        kind: &str,
+        name: &str,
+        schema: &FeedSchema,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
+        self.commands(vec![serde_json::json!({
+            "command": "set_schema",
+            "scope": {"kind": kind, "name": name},
+            "schema": schema,
+        })])
+        .await
+    }
+
+    async fn clear_schema(
+        &self,
+        kind: &str,
+        name: &str,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
+        self.commands(vec![serde_json::json!({
+            "command": "clear_schema",
+            "scope": {"kind": kind, "name": name},
+        })])
+        .await
+    }
+
     pub fn create_reader<K, V>(
         &self,
         domain: &Domain,

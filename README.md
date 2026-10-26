@@ -104,6 +104,34 @@ progress survives restarts under the same `reader_id`.
 `reader_start_point(..)` applies only on first declaration; an existing
 Reader resumes its acknowledged frontier.
 
+### Record schemas
+
+Records stay schema-neutral bytes on the wire; a Feed can still declare
+schema metadata the catalog tracks for tooling, validation, and
+compatibility. The Domain's schema is the default every Feed inherits;
+a Feed's own declaration overrides the named sides:
+
+```rust
+client.set_domain_schema("shop", &FeedSchema {
+    value: Some(SchemaDecl { format: "json".into(), subject: Some("order-v1".into()), definition: None }),
+    ..FeedSchema::default()
+}).await?;
+client.set_feed_schema("shop.orders", &FeedSchema {
+    key: Some(SchemaDecl { format: "text".into(), subject: None, definition: None }),
+    ..FeedSchema::default()
+}).await?;
+
+shop.schema().await?;                      // the Domain default
+shop.feed_schema("shop.orders").await?;    // effective: key=text, value=json/order-v1
+shop.declared_feed_schema("shop.orders").await?;
+client.clear_feed_schema("shop.orders").await?;  // reverts to inheritance
+```
+
+`SET SCHEMA ON DOMAIN|FEED <name> (KEY|VALUE <format> [SUBJECT 'x']
+[DEFINITION 'y'])+` in WCL does the same; `SHOW SCHEMAS` lists declared
+assignments. Formats today: `text`, `json`, `protobuf`, `avro`,
+`custom.<name>` — compatibility enforcement is still a no-op.
+
 ## Codecs
 
 `Codec<T>` is a bidirectional value contract — `encode`/`decode` once,

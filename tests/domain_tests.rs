@@ -372,3 +372,138 @@ async fn refresh_repulls_the_catalog_snapshot() {
     shop.refresh().await.unwrap();
     assert_eq!(transport.take_requests().len(), 2);
 }
+
+/// Catalog reply carrying schema rows: the Domain declares a json value
+/// default, `shop.orders` overrides only the key side, `shop.returns`
+/// inherits wholesale.
+fn schema_catalog_reply() -> (u16, Value) {
+    (
+        200,
+        json!({
+            "revision": 9,
+            "results": [
+                { "data": {
+                    "space_id": DOMAIN_ID,
+                    "name": "shop",
+                    "status": "active",
+                    "created_at_ns": "1700000000000000000",
+                    "schema": {"value": {"format": "json", "subject": "order-v1"}}
+                } },
+                { "data": [
+                    { "name": "shop.orders", "feed_id": FEED_ID, "space_id": DOMAIN_ID,
+                      "schema": {"key": {"format": "text"}},
+                      "effective_schema": {"key": {"format": "text"}, "value": {"format": "json", "subject": "order-v1"}} },
+                    { "name": "shop.returns", "feed_id": "66666666-6666-6666-6666-666666666666", "space_id": DOMAIN_ID,
+                      "schema": null,
+                      "effective_schema": {"value": {"format": "json", "subject": "order-v1"}} },
+                    { "name": "other.feed", "feed_id": "44444444-4444-4444-4444-444444444444", "space_id": "55555555-5555-5555-5555-555555555555" }
+                ] },
+                { "data": [] },
+                { "data": [] },
+                { "data": [] },
+                { "data": [] },
+                { "data": [] },
+                { "data": [] }
+            ]
+        }),
+    )
+}
+
+#[tokio::test]
+async fn feed_schema_layers_feed_over_domain() {
+    let (client, _transport) = client(vec![schema_catalog_reply()]);
+    let shop = client.get_domain("shop").await.unwrap();
+
+    let domain = shop.schema().await.unwrap().unwrap();
+    assert_eq!(domain.value.as_ref().unwrap().format, "json");
+    assert_eq!(
+        domain.value.as_ref().unwrap().subject.as_deref(),
+        Some("order-v1")
+    );
+
+    let effective = shop.feed_schema("shop.orders").await.unwrap().unwrap();
+    assert_eq!(effective.key.as_ref().unwrap().format, "text");
+    assert_eq!(effective.value.as_ref().unwrap().format, "json");
+
+    let declared = shop
+        .declared_feed_schema("shop.orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(declared.key.as_ref().unwrap().format, "text");
+    assert!(declared.value.is_none());
+
+    let inherited = shop.feed_schema("shop.returns").await.unwrap().unwrap();
+    assert_eq!(inherited.value.as_ref().unwrap().format, "json");
+    assert!(inherited.key.is_none());
+    assert!(shop
+        .declared_feed_schema("shop.returns")
+        .await
+        .unwrap()
+        .is_none());
+
+    assert!(shop.feed_schema("other.feed").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn set_and_clear_schema_emit_typed_commands() {
+    let replies = vec![
+        (200, json!({ "revision": 1, "results": [{ "data": {} }] })),
+        (200, json!({ "revision": 2, "results": [{ "data": {} }] })),
+        (200, json!({ "revision": 3, "results": [{ "data": {} }] })),
+    ];
+    let (client, transport) = client(replies);
+
+    client
+        .set_domain_schema(
+            "shop",
+            &FeedSchema {
+                key: None,
+                value: Some(SchemaDecl {
+                    format: "json".to_owned(),
+                    subject: Some("order-v1".to_owned()),
+                    definition: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .set_feed_schema(
+            "shop.orders",
+            &FeedSchema {
+                key: Some(SchemaDecl {
+                    format: "text".to_owned(),
+                    subject: None,
+                    definition: None,
+                }),
+                value: None,
+            },
+        )
+        .await
+        .unwrap();
+    client.clear_feed_schema("shop.orders").await.unwrap();
+
+    let requests = transport.take_requests();
+    let commands: Vec<Value> = requests
+        .iter()
+        .filter(|(_, path, _)| path == "/v1/admin/commands")
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0]["commands"][0]["command"], "set_schema");
+    assert_eq!(commands[0]["commands"][0]["scope"]["kind"], "domain");
+    assert_eq!(commands[0]["commands"][0]["scope"]["name"], "shop");
+    assert_eq!(
+        commands[0]["commands"][0]["schema"]["value"]["format"],
+        "json"
+    );
+    assert_eq!(commands[0]["commands"][0]["schema"]["key"], Value::Null);
+    assert_eq!(commands[1]["commands"][0]["scope"]["kind"], "feed");
+    assert_eq!(
+        commands[1]["commands"][0]["schema"]["key"]["format"],
+        "text"
+    );
+    assert_eq!(commands[2]["commands"][0]["command"], "clear_schema");
+    assert_eq!(commands[2]["commands"][0]["scope"]["name"], "shop.orders");
+}
