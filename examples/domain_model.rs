@@ -45,8 +45,10 @@ async fn main() -> Result<(), whitewater::SdkError> {
     // Pure name composition — no I/O.
     let orders = shop.feed("orders")?;
 
-    // Durable produce identity — declares when missing, opens a fenced
-    // session.
+    // Builders hang off the Domain — a typed Feed handle keeps its
+    // codecs (client.create_writer(&shop, &orders)), while the
+    // relative-name form shop.create_writer("orders") resolves inside
+    // the Domain.
     let writer = client
         .create_writer(&shop, &orders)?
         .writer_id("ingest")
@@ -58,8 +60,8 @@ async fn main() -> Result<(), whitewater::SdkError> {
 
     // Durable consume identity + first-time start position; reopening
     // the same id resumes the acknowledged frontier.
-    let mut reader = client
-        .create_reader(&shop, &orders)?
+    let mut reader = shop
+        .create_reader("orders")?
         .reader_id("audit")
         .reader_start_point(ReaderStart::Beginning)
         .capacity(64)

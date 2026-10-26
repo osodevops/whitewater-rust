@@ -531,3 +531,88 @@ async fn create_feed_composes_the_domain_prefix() {
     assert!(shop2.create_feed("BAD.NAME").await.is_err());
     assert!(transport2.take_requests().is_empty());
 }
+
+/// Domain-hanging builders resolve relative feeds, and
+/// `FeedReader::for_each` acks each handled page — a stopped handler
+/// leaves the in-flight page unacked so it replays.
+#[tokio::test]
+async fn domain_scoped_builders_and_for_each_ack_per_page() {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let record = |key: &str, payload: &str| {
+        json!({
+            "message_id": "00000000-0000-0000-0000-000000000000",
+            "key_base64": b64.encode(key.as_bytes()),
+            "payload_base64": b64.encode(payload.as_bytes()),
+            "metadata_base64": {},
+            "event_time_ns": "1",
+            "ingest_time_ns": "2",
+            "cursor": "rc"
+        })
+    };
+    let (client1, transport) = client(vec![
+        (200, json!({ "results": [] })), // CREATE WRITER
+        (200, json!({ "results": [] })), // CREATE READER
+        open_reader_reply(),             // readers/open
+        (
+            200,
+            json!({ "records": [record("a", "1")], "delivered_cursor": "d1",
+                    "recommended_capacity": 4, "retry_after_ms": 5 }),
+        ),
+        (
+            200,
+            json!({ "session_epoch": 3, "acknowledged_cursor": "d1" }),
+        ), // ack p1
+        (
+            200,
+            json!({ "records": [record("b", "2")], "delivered_cursor": "d2" }),
+        ),
+    ]);
+    let shop = client1.domain("shop").unwrap();
+
+    // The writer builder hangs off the Domain too.
+    shop.create_writer("orders")
+        .unwrap()
+        .writer_id("ingest")
+        .declare()
+        .await
+        .unwrap();
+
+    let mut reader = shop
+        .create_reader("orders")
+        .unwrap()
+        .reader_id("fulfillment")
+        .reader_start_point(ReaderStart::Beginning)
+        .capacity(1)
+        .open()
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    reader
+        .for_each(|m| {
+            seen.push(m.key.clone().unwrap());
+            std::future::ready(Ok::<bool, SdkError>(seen.len() < 2))
+        })
+        .await
+        .unwrap();
+    assert_eq!(seen, vec!["a".to_owned(), "b".to_owned()]);
+
+    let requests = transport.take_requests();
+    assert_eq!(
+        requests[0].2["script"],
+        "CREATE WRITER ingest TO shop.orders;"
+    );
+    let acks = requests
+        .iter()
+        .filter(|(_, path, _)| path == "/v1/readers/ack")
+        .count();
+    assert_eq!(acks, 1, "page 2 stays unacked so its tail replays");
+
+    // Malformed names refuse before any builder work.
+    let (client2, transport2) = client(vec![]);
+    let shop2 = client2.domain("shop").unwrap();
+    assert!(shop2.create_reader("BAD.NAME").is_err());
+    assert!(shop2.create_writer("BAD.NAME").is_err());
+    assert!(transport2.take_requests().is_empty());
+}

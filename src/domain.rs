@@ -268,6 +268,36 @@ impl Domain {
         self.client.wcl(&format!("CREATE FEED {full}")).await
     }
 
+    /// Fluent Reader declaration on `relative` inside this Domain —
+    /// `shop.create_reader("orders")` binds `shop.orders`:
+    ///
+    /// ```ignore
+    /// let mut reader = shop
+    ///     .create_reader("orders")?
+    ///     .reader_id("fulfillment")               // the Kafka groupId analogue
+    ///     .reader_start_point(ReaderStart::Beginning)
+    ///     .open()
+    ///     .await?;
+    /// ```
+    ///
+    /// [`Client::create_reader`] accepts the typed [`Feed`] handle.
+    pub fn create_reader(
+        &self,
+        relative: &str,
+    ) -> Result<ReaderBuilder<String, Vec<u8>>, SdkError> {
+        self.client.create_reader(self, &self.feed(relative)?)
+    }
+
+    /// Fluent Writer declaration on `relative` inside this Domain —
+    /// `shop.create_writer("orders")` binds `shop.orders`.
+    /// [`Client::create_writer`] accepts the typed [`Feed`] handle.
+    pub fn create_writer(
+        &self,
+        relative: &str,
+    ) -> Result<WriterBuilder<String, Vec<u8>>, SdkError> {
+        self.client.create_writer(self, &self.feed(relative)?)
+    }
+
     /// Resolve `relative` to a full dotted Feed name inside this Domain
     /// — accepts the short form (`"orders"`) or the already-qualified
     /// form (`"shop.orders"`). A name that fails the dotted grammar is

@@ -42,10 +42,10 @@ async fn main() -> Result<(), whitewater::SdkError> {
     // composition, no I/O.
     let orders = shop.feed_with("orders", Codec::utf8(), Codec::<Order>::json())?;
 
-    // WriterBuilder: durable produce identity, declares when missing,
-    // opens a fenced session.
-    let writer = client
-        .create_writer(&shop, &orders)?
+    // Everything a service needs hangs off the Domain — relative
+    // names resolve inside it.
+    let writer = shop
+        .create_writer("orders")?            // utf8 keys / byte payloads
         .writer_id("checkout")
         .open()
         .await?;
@@ -53,16 +53,25 @@ async fn main() -> Result<(), whitewater::SdkError> {
         id: "o-1".to_owned(),
         total: 4200,
     }).await?;
+    // typed feeds: client.create_writer(&shop, &orders)? takes &Feed<K,V>
 
     // ReaderBuilder: durable consume identity (the Kafka groupId
     // analogue) plus a first-time start position.
-    let mut reader = client
-        .create_reader(&shop, &orders)?
+    let mut reader = shop
+        .create_reader("orders")?
         .reader_id("audit")
         .reader_start_point(ReaderStart::Beginning)
         .capacity(64)
         .open()
         .await?;
+    // Per-record pump — deliver each message, ack each handled page:
+    reader
+        .for_each(|m| async move {
+            handle(&m).await?;
+            Ok(true)                         // false stops, leaving the page unacked
+        })
+        .await?;
+    // or stay manual:
     let page = reader.fetch(16).await?;
     for message in &page.records {
         println!("{:?} -> {:?}", message.key, message.value.id);
@@ -220,11 +229,11 @@ contract.
 | Area | API |
 |---|---|
 | Client & transport | `Client::http(endpoints, api_key)` `Client::new` · `use_compression` `with_api_key` `wire` · `health` `check_compatible` `transport_limits` |
-| Typed Domains | `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` · `create_feed` |
+| Typed Domains | `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` · `create_feed` `create_reader` `create_writer` (relative) |
 | Schemas | `set_domain_schema` `set_feed_schema` `clear_domain_schema` `clear_feed_schema` · `Domain::schema` `feed_schema` `declared_feed_schema` · `SchemaDecl`/`FeedSchema` — `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`, `custom.<name>` |
 | Feeds | `feed(name)` / `feed_with(name, Codec, Codec)` → `Feed<K,V>` · `use_compression` · `records` `fetch` `load` · `writer` `append` `reader` `consumer` `subscribe` `view` |
 | Writing | `FeedWriter::append` `append_event` `append_batch` · `reopen` `session_epoch` · idempotent `request_id` · `FeedEvent` carries event time + Metadata |
-| Reading | `FeedReader::fetch` `ack` `close` · `session_epoch` `acknowledged_cursor` · durable `reader_id` · `ReaderStart` — `Beginning`, `Now`, `Cursor`, `TimestampNs` |
+| Reading | `FeedReader::for_each` pump · `fetch` `ack` `close` · `session_epoch` `acknowledged_cursor` · durable `reader_id` · `ReaderStart` — `Beginning`, `Now`, `Cursor`, `TimestampNs` |
 | Temporary fetches | `client.temporary_fetch` / `Feed::fetch` — `after_event_time_ns` seeks, `new_only`, `tail` + `wait_ms` long-poll · `Feed::records` `Feed::load` |
 | Consumers | `feed.consumer(reader)` → `FeedConsumer`/`ConsumerHandle`: `start_at` `capacity` `backoff` `on_error` `handle` `next` `run` `stop` `wait` `close` |
 | Subscription members | `client.member(subscription)` → `Member`: `member_id` `member_epoch` `claim` `fetch` `ack` `renew` `release` — shared progress + RF3 work leases · `Feed::subscribe` managed loop |

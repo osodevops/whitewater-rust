@@ -257,6 +257,41 @@ impl<K, V> FeedReader<K, V> {
     pub async fn close(self) -> Result<(), SdkError> {
         self.session.close().await
     }
+
+    /// Deliver every record to `handler` — one at a time — acking each
+    /// fetched page after its records are handled. The pump paces empty
+    /// fetches on the server's `retry_after_ms`, adopts the returned
+    /// `recommended_capacity`, and runs until the future is dropped
+    /// (`tokio::select!` it against a shutdown token). A handler
+    /// returning `false` — or an error — leaves the in-flight page
+    /// unacked so its tail replays: at-least-once delivery, never
+    /// acknowledge undelivered records.
+    pub async fn for_each<F, Fut>(&mut self, mut handler: F) -> Result<(), SdkError>
+    where
+        F: FnMut(FeedMessage<K, V>) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, SdkError>>,
+    {
+        let mut capacity = 128_u64;
+        loop {
+            let page = self.fetch(capacity).await?;
+            if let Some(recommended) = page.recommended_capacity {
+                capacity = recommended.max(1);
+            }
+            if page.records.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    page.retry_after_ms.unwrap_or(1).max(1),
+                ))
+                .await;
+                continue;
+            }
+            for message in page.records {
+                if !handler(message).await? {
+                    return Ok(());
+                }
+            }
+            self.ack().await?;
+        }
+    }
 }
 
 /// Handle for a running `Feed::subscribe` consumer task. `stop`
