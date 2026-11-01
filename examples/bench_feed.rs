@@ -53,6 +53,7 @@ struct WriteStats {
 
 struct WriteWork {
     autotuned: Option<whitewater::AutoTune>,
+    binary_appends: bool,
     share: u64,
     batch: u64,
     payload: Vec<u8>,
@@ -67,6 +68,7 @@ async fn write_worker(
 ) {
     let WriteWork {
         autotuned,
+        binary_appends,
         share,
         batch,
         payload,
@@ -79,6 +81,11 @@ async fn write_worker(
             eprintln!("writer {writer_name} session failed: {error}");
             return;
         }
+    };
+    let writer = if binary_appends {
+        writer.binary_appends()
+    } else {
+        writer
     };
     let autotuned = autotuned.map(|tune| writer.autotuned(tune));
     let mut sent = 0u64;
@@ -247,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let writers = env_u64("BENCH_WRITERS", 4) as usize;
     let batch = env_u64("BENCH_BATCH", 50);
     let autotune = env_u64("BENCH_AUTOTUNE", 0) != 0;
+    let binary_writes = env_str("BENCH_WRITE_FORMAT", "json") == "binary";
     let tune = whitewater::AutoTune {
         max_batch: env_u64("BENCH_MAX_BATCH", 512) as usize,
         max_in_flight: env_u64("BENCH_IN_FLIGHT", 2) as usize,
@@ -332,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writer_names[index].clone(),
                 WriteWork {
                     autotuned: autotune.then_some(tune),
+                    binary_appends: binary_writes,
                     share: shares[index],
                     batch,
                     payload: payload.clone(),

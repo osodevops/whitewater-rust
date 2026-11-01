@@ -53,6 +53,22 @@ pub trait Transport: Send + Sync {
             "binary fetch is not supported by this Transport".to_owned(),
         ))
     }
+
+    /// Binary request body — `Content-Type:
+    /// application/vnd.whitewater.frames`, raw FSA1 append frames out,
+    /// the JSON outcome back. The default refuses so JSON-only test
+    /// transports keep compiling unchanged.
+    async fn request_binary_body(
+        &self,
+        _base: &str,
+        _path: &str,
+        _body: &[u8],
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        Err(SdkError::Refused(
+            "binary append is not supported by this Transport".to_owned(),
+        ))
+    }
 }
 
 /// Production reqwest transport over rustls. `request_timeout` bounds
@@ -133,5 +149,30 @@ impl Transport for HttpTransport {
             .map_err(|error| SdkError::Transport(error.to_string()))?
             .to_vec();
         Ok(TransportBytesReply { status, body })
+    }
+
+    async fn request_binary_body(
+        &self,
+        base: &str,
+        path: &str,
+        body: &[u8],
+        api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(api_key)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.whitewater.frames",
+            )
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|error| SdkError::Transport(error.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+        Ok(TransportReply { status, body })
     }
 }

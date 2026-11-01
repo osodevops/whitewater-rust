@@ -206,6 +206,55 @@ pub(crate) fn parse_frame_page(bytes: &[u8]) -> Result<(Vec<Record>, Option<Stri
     ))
 }
 
+/// Client-side `FSA1` append record — the binary form of one
+/// `WriterSessionAppendRequest` (server mints identity/sequence/
+/// ingest-time downstream).
+pub struct AppendFrame<'a> {
+    pub writer: &'a str,
+    pub request_id: uuid::Uuid,
+    pub session_epoch: u64,
+    pub event_time_ns: Option<i64>,
+    pub use_compression: bool,
+    pub key: &'a [u8],
+    pub payload: &'a [u8],
+    pub metadata: &'a std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+/// Encode an append batch as an `application/vnd.whitewater.frames`
+/// body: `u32 count` then `u32 body_len | body | u32 crc32(body)`
+/// frames — big-endian, mirroring the stored-codec envelope.
+pub fn encode_append_page(records: &[AppendFrame<'_>]) -> Vec<u8> {
+    let mut page = Vec::with_capacity(4 + records.len() * 32);
+    page.extend_from_slice(&(records.len() as u32).to_be_bytes());
+    for record in records {
+        let mut body = Vec::with_capacity(64 + record.key.len() + record.payload.len());
+        body.extend_from_slice(b"FSA1");
+        body.extend_from_slice(&(record.writer.len() as u16).to_be_bytes());
+        body.extend_from_slice(record.writer.as_bytes());
+        body.extend_from_slice(record.request_id.as_bytes());
+        body.extend_from_slice(&record.session_epoch.to_be_bytes());
+        body.push(u8::from(record.event_time_ns.is_some()) | u8::from(record.use_compression) << 1);
+        if let Some(event_time_ns) = record.event_time_ns {
+            body.extend_from_slice(&event_time_ns.to_be_bytes());
+        }
+        body.extend_from_slice(&(record.key.len() as u32).to_be_bytes());
+        body.extend_from_slice(record.key);
+        body.extend_from_slice(&(record.payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(record.payload);
+        body.extend_from_slice(&(record.metadata.len() as u16).to_be_bytes());
+        for (name, value) in record.metadata {
+            body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(value);
+        }
+        page.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        page.extend_from_slice(&body);
+        page.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+    }
+    page
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::Client;
@@ -23,6 +23,9 @@ pub struct Writer {
     pub(crate) session_epoch: u64,
     /// Sticky endpoint: session state is Node-local.
     pub(crate) pinned: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Opt-in binary append transport (`FSA1` frames); JSON is the
+    /// default wire contract.
+    pub(crate) binary_appends: bool,
 }
 
 impl Writer {
@@ -74,12 +77,27 @@ impl Writer {
         decode_append_outcome(&body)
     }
 
+    /// Opt into binary `FSA1` append frames on `append_batch`: the
+    /// request body ships `application/vnd.whitewater.frames` instead
+    /// of JSON+base64 — ~25% less wire and no serde pass either side.
+    /// Appends stay idempotent: the request_ids ride inside the frames.
+    /// JSON remains the default; unsupported Transports answer
+    /// [`SdkError::Refused`].
+    pub fn binary_appends(&self) -> Self {
+        let mut writer = self.clone();
+        writer.binary_appends = true;
+        writer
+    }
+
     /// Append a batch as one request; per-record `request_id`s keep the
     /// same retry contract as `append`.
     pub async fn append_batch(
         &self,
         records: &[(Uuid, Vec<u8>, Vec<u8>, i64)],
     ) -> Result<Vec<AppendOutcome>, SdkError> {
+        if self.binary_appends {
+            return self.append_batch_binary(records).await;
+        }
         let items: Vec<serde_json::Value> = records
             .iter()
             .map(|(request_id, key, payload, event_time_ns)| {
@@ -110,7 +128,46 @@ impl Writer {
             .unwrap_or_default();
         outcomes.iter().map(decode_append_outcome).collect()
     }
+
+    /// `FSA1` wire form of [`Writer::append_batch`] — same request/response
+    /// contract, frames instead of JSON.
+    async fn append_batch_binary(
+        &self,
+        records: &[(Uuid, Vec<u8>, Vec<u8>, i64)],
+    ) -> Result<Vec<AppendOutcome>, SdkError> {
+        let frames: Vec<crate::frame::AppendFrame<'_>> = records
+            .iter()
+            .map(
+                |(request_id, key, payload, event_time_ns)| crate::frame::AppendFrame {
+                    writer: &self.name,
+                    request_id: *request_id,
+                    session_epoch: self.session_epoch,
+                    event_time_ns: Some(*event_time_ns),
+                    use_compression: false,
+                    key,
+                    payload,
+                    metadata: &NO_METADATA,
+                },
+            )
+            .collect();
+        let body = self
+            .client
+            .session_call_binary_body(
+                &self.pinned,
+                "/v1/writers/append-batch",
+                &crate::frame::encode_append_page(&frames),
+            )
+            .await?;
+        let outcomes = body
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or_else(|| SdkError::Protocol("append-batch returned no results".to_owned()))?;
+        outcomes.iter().map(decode_append_outcome).collect()
+    }
 }
+
+static NO_METADATA: std::sync::LazyLock<BTreeMap<String, Vec<u8>>> =
+    std::sync::LazyLock::new(BTreeMap::new);
 
 /// Request-side knobs for [`Writer::batched`] / [`Writer::autotuned`].
 pub use crate::autotune::{AutoTune, Batching};

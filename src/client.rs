@@ -133,6 +133,24 @@ impl Client {
         }
     }
 
+    /// Binary-body append against a named base — no rotation.
+    pub(crate) async fn call_on_binary_body(
+        &self,
+        base: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Value, SdkError> {
+        match self
+            .transport
+            .request_binary_body(base, path, body, &self.api_key)
+            .await
+        {
+            Ok(reply) if (200..300).contains(&reply.status) => Ok(reply.body),
+            Ok(reply) => Err(map_error(reply.status, &reply.body)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Session-bound call pinned to `pinned` — hops to the next pooled
     /// base only on transport failure, then re-pins to the survivor.
     /// API refusals return unchanged (they are authoritative on every
@@ -149,6 +167,28 @@ impl Client {
             Err(SdkError::Transport(_)) => {
                 let fallback = self.base().to_owned();
                 let result = self.call_on(&fallback, method, path, body).await;
+                if result.is_ok() {
+                    *pinned.lock().expect("pinned base") = fallback;
+                }
+                result
+            }
+            other => other,
+        }
+    }
+
+    /// Binary-append variant of [`Client::session_call`] — same
+    /// pin-then-failover contract for FSA1 frame bodies.
+    pub(crate) async fn session_call_binary_body(
+        &self,
+        pinned: &std::sync::Arc<std::sync::Mutex<String>>,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Value, SdkError> {
+        let base = pinned.lock().expect("pinned base").clone();
+        match self.call_on_binary_body(&base, path, body).await {
+            Err(SdkError::Transport(_)) => {
+                let fallback = self.base().to_owned();
+                let result = self.call_on_binary_body(&fallback, path, body).await;
                 if result.is_ok() {
                     *pinned.lock().expect("pinned base") = fallback;
                 }
@@ -339,6 +379,7 @@ impl Client {
             name: name.to_owned(),
             session_epoch: epoch,
             pinned: std::sync::Arc::new(std::sync::Mutex::new(base)),
+            binary_appends: false,
         })
     }
 
