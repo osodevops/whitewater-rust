@@ -17,6 +17,8 @@ pub struct Reader {
     pub(crate) session_epoch: u64,
     pub(crate) delivered_cursor: Option<String>,
     pub(crate) acknowledged_cursor: Option<String>,
+    /// Sticky endpoint: session state (pacing, cursors) is Node-local.
+    pub(crate) pinned: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Reader {
@@ -38,7 +40,8 @@ impl Reader {
     pub async fn fetch(&mut self, limit: u64) -> Result<FetchPage, SdkError> {
         let body = self
             .client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/readers/fetch",
                 Some(&json!({
@@ -88,7 +91,8 @@ impl Reader {
         };
         let body = self
             .client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/readers/ack",
                 Some(&json!({
@@ -111,7 +115,8 @@ impl Reader {
     /// restart point for the next `open`.
     pub async fn close(self) -> Result<(), SdkError> {
         self.client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/readers/close",
                 Some(&json!({
@@ -122,5 +127,51 @@ impl Reader {
             )
             .await?;
         Ok(())
+    }
+}
+
+/// Adaptive-limit Reader: pages grow while they return full (a drain
+/// favors fewer, larger requests) — the read-side sibling of
+/// [`crate::PumpedWriter`]'s batch tuning. Tail pacing stays with the
+/// server's `retry_after_ms`, which [`FeedConsumer`](crate::FeedConsumer)
+/// pumps already honor.
+pub struct AutoReader {
+    inner: Reader,
+    tuner: crate::autotune::ReadTuner,
+    limit: u64,
+}
+
+impl Reader {
+    /// Fetch with a self-tuned page limit instead of a fixed capacity.
+    pub fn autotuned(self) -> AutoReader {
+        let tuner = crate::autotune::ReadTuner::default();
+        let limit = tuner.limit();
+        AutoReader {
+            inner: self,
+            tuner,
+            limit,
+        }
+    }
+}
+
+impl AutoReader {
+    /// Fetch one page at the tuner's current limit, then fold the
+    /// page's fill into the next limit decision.
+    pub async fn fetch(&mut self) -> Result<FetchPage, SdkError> {
+        let page = self.inner.fetch(self.limit).await?;
+        let (limit, _) = self.tuner.next(page.records.len());
+        self.limit = limit;
+        Ok(page)
+    }
+
+    /// Acknowledge the latest fetched page — same contract as
+    /// [`Reader::ack`].
+    pub async fn ack(&mut self) -> Result<(), SdkError> {
+        self.inner.ack().await
+    }
+
+    /// Current adaptive page limit — diagnostics surface this.
+    pub fn limit(&self) -> u64 {
+        self.limit
     }
 }

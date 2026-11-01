@@ -40,6 +40,7 @@
 //! # }
 //! ```
 
+mod autotune;
 mod client;
 mod codec;
 mod consumer;
@@ -58,6 +59,7 @@ mod typed;
 mod typed_store;
 mod writer;
 
+pub use autotune::{AutoTune, Batching};
 pub use client::Client;
 pub use codec::Codec;
 pub use consumer::{ConsumerHandle, FeedConsumer, ReaderStart};
@@ -70,7 +72,7 @@ pub use feed::{
 pub use member::{ClaimedWork, Member, WorkPage};
 pub use model::{AppendOutcome, FetchPage, Record, TemporaryFetch, TemporaryPage, TransportLimits};
 pub use pipe::{Pipe, PipeInfo};
-pub use reader::Reader;
+pub use reader::{AutoReader, Reader};
 pub use store::{
     GetByPage, IteratePage, LookupOutcome, MutationOutcome, ReadFreshness, StateStore, StoreRow,
     SyncOutcome,
@@ -78,4 +80,4 @@ pub use store::{
 pub use transport::{HttpTransport, Transport, TransportReply};
 pub use typed::{IndexBound, IndexPage, IndexQuery, TypedValue};
 pub use typed_store::{IterateRows, Lookup, Row, RowPage, Store};
-pub use writer::Writer;
+pub use writer::{PumpedWriter, Writer};

@@ -103,17 +103,59 @@ impl Client {
         let mut last = SdkError::Transport("no Node attempted".to_owned());
         for _ in 0..self.bases.len() {
             let base = self.base().to_owned();
-            match self
-                .transport
-                .request(&base, method, path, body, &self.api_key)
-                .await
-            {
-                Ok(reply) if (200..300).contains(&reply.status) => return Ok(reply.body),
-                Ok(reply) => return Err(map_error(reply.status, &reply.body)),
-                Err(error) => last = error,
+            match self.call_on(&base, method, path, body).await {
+                Err(SdkError::Transport(error)) => last = SdkError::Transport(error),
+                other => return other,
             }
         }
         Err(last)
+    }
+
+    /// One exchange against a named base — no rotation. Session-bound
+    /// calls pin to the Node that opened them: rotating endpoints
+    /// mid-session strands Node-local pacing/progress state (the
+    /// ReaderPacingTable never sees a matching ack).
+    pub(crate) async fn call_on(
+        &self,
+        base: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, SdkError> {
+        match self
+            .transport
+            .request(base, method, path, body, &self.api_key)
+            .await
+        {
+            Ok(reply) if (200..300).contains(&reply.status) => Ok(reply.body),
+            Ok(reply) => Err(map_error(reply.status, &reply.body)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Session-bound call pinned to `pinned` — hops to the next pooled
+    /// base only on transport failure, then re-pins to the survivor.
+    /// API refusals return unchanged (they are authoritative on every
+    /// Node).
+    pub(crate) async fn session_call(
+        &self,
+        pinned: &std::sync::Arc<std::sync::Mutex<String>>,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, SdkError> {
+        let base = pinned.lock().expect("pinned base").clone();
+        match self.call_on(&base, method, path, body).await {
+            Err(SdkError::Transport(_)) => {
+                let fallback = self.base().to_owned();
+                let result = self.call_on(&fallback, method, path, body).await;
+                if result.is_ok() {
+                    *pinned.lock().expect("pinned base") = fallback;
+                }
+                result
+            }
+            other => other,
+        }
     }
 
     /// Binary sibling of [`Client::call`]: the same endpoint-pool
@@ -277,6 +319,7 @@ impl Client {
     /// Bind a declared Writer for appends: `OPEN WRITER SESSION` pins the
     /// session epoch the server fences every append against.
     pub async fn writer(&self, name: &str) -> Result<Writer, SdkError> {
+        let base = self.base().to_owned();
         let results = self.wcl(&format!("OPEN WRITER SESSION {name};")).await?;
         let epoch = results
             .iter()
@@ -295,12 +338,14 @@ impl Client {
             client: self.clone(),
             name: name.to_owned(),
             session_epoch: epoch,
+            pinned: std::sync::Arc::new(std::sync::Mutex::new(base)),
         })
     }
 
     /// Bind a declared Reader: `reader.open` returns the session epoch
     /// and the current delivered/acknowledged cursors.
     pub async fn reader(&self, name: &str, capacity: u64) -> Result<Reader, SdkError> {
+        let base = self.base().to_owned();
         let body = self
             .call(
                 "POST",
@@ -328,11 +373,13 @@ impl Client {
                 .get("acknowledged_cursor")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            pinned: std::sync::Arc::new(std::sync::Mutex::new(base)),
         })
     }
 
     /// Join a Subscription as a cooperating member.
     pub async fn member(&self, subscription: &str) -> Result<Member, SdkError> {
+        let base = self.base().to_owned();
         let member_id = Uuid::new_v4();
         let body = self
             .call(
@@ -345,14 +392,16 @@ impl Client {
                 })),
             )
             .await?;
-        Ok(Member::for_testing(
+        let member = Member::for_testing(
             self.clone(),
             subscription,
             member_id,
             body.get("member_epoch")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-        ))
+        );
+        *member.pinned.lock().expect("pinned base") = base;
+        Ok(member)
     }
 
     /// Read a page straight off a Feed: `after` resumes from an opaque

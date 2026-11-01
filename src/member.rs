@@ -42,6 +42,8 @@ pub struct Member {
     subscription: String,
     member_id: Uuid,
     member_epoch: u64,
+    /// Sticky endpoint: lease/pacing state is Node-local.
+    pub(crate) pinned: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Member {
@@ -59,6 +61,7 @@ impl Member {
             subscription: subscription.to_owned(),
             member_id,
             member_epoch,
+            pinned: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
         }
     }
 
@@ -77,7 +80,8 @@ impl Member {
         let work_id = Uuid::new_v4();
         let body = self
             .client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/subscriptions/members/claim",
                 Some(&json!({
@@ -112,7 +116,8 @@ impl Member {
     pub async fn fetch(&self, work: &ClaimedWork, limit: u64) -> Result<WorkPage, SdkError> {
         let body = self
             .client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/subscriptions/members/fetch",
                 Some(&json!({
@@ -157,7 +162,8 @@ impl Member {
     /// leases fence as `LeaseStale`/`StaleEpoch`, never silent loss.
     pub async fn ack(&self, work: &ClaimedWork, page: &WorkPage) -> Result<(), SdkError> {
         self.client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/subscriptions/members/ack",
                 Some(&json!({
@@ -178,7 +184,8 @@ impl Member {
     /// Renew a held lease; expiry without renew is `LeaseStale` fencing.
     pub async fn renew(&self, work: &ClaimedWork, lease_ticks: u64) -> Result<(), SdkError> {
         self.client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/subscriptions/members/renew",
                 Some(&json!({
@@ -199,7 +206,8 @@ impl Member {
     /// member under a fresh lease.
     pub async fn release(&self, work: &ClaimedWork) -> Result<(), SdkError> {
         self.client
-            .call(
+            .session_call(
+                &self.pinned,
                 "POST",
                 "/v1/subscriptions/members/release",
                 Some(&json!({

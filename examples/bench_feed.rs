@@ -14,7 +14,8 @@
 //! `BENCH_RECORDS`, `BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`,
 //! `BENCH_FEEDS` (parallel pipelines = Kafka partition count),
 //! `BENCH_PAGE_LIMIT`, `BENCH_READ_FORMAT` (`binary`|`json`),
-//! `BENCH_MODE` (`all`|`write`|`read`).
+//! `BENCH_MODE` (`all`|`write`|`read`), `BENCH_AUTOTUNE`
+//! (self-adjusting batch pump instead of caller-sized batches).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -50,15 +51,27 @@ struct WriteStats {
     errors: AtomicU64,
 }
 
-async fn write_worker(
-    client: Client,
-    writer_name: String,
+struct WriteWork {
+    autotuned: Option<whitewater::AutoTune>,
     share: u64,
     batch: u64,
     payload: Vec<u8>,
     base_index: u64,
+}
+
+async fn write_worker(
+    client: Client,
+    writer_name: String,
+    work: WriteWork,
     stats: std::sync::Arc<WriteStats>,
 ) {
+    let WriteWork {
+        autotuned,
+        share,
+        batch,
+        payload,
+        base_index,
+    } = work;
     let writer = match client.writer(&writer_name).await {
         Ok(writer) => writer,
         Err(error) => {
@@ -67,8 +80,55 @@ async fn write_worker(
             return;
         }
     };
+    let autotuned = autotuned.map(|tune| writer.autotuned(tune));
     let mut sent = 0u64;
     let mut index = base_index;
+    if let Some(pumped) = autotuned {
+        // Producer-style: queue records without awaiting each — the
+        // pump coalesces the queue into append-batch rounds; each
+        // record's returned future resolves when its batch commits.
+        let mut pending = tokio::task::JoinSet::new();
+        while sent < share || !pending.is_empty() {
+            if sent < share && pending.len() < 4_096 {
+                let key = format!("key-{index:012}").into_bytes();
+                let record = payload.clone();
+                let time = 1_700_000_000_000_000_000i64 + index as i64;
+                let pumped = pumped.clone();
+                pending.spawn(async move {
+                    (
+                        Instant::now(),
+                        pumped.append(Uuid::new_v4(), &key, &record, time).await,
+                    )
+                });
+                index += 1;
+                sent += 1;
+            } else {
+                match pending.join_next().await {
+                    Some(Ok((started, Ok(_)))) => {
+                        stats
+                            .latencies_ms
+                            .lock()
+                            .expect("latencies")
+                            .push(started.elapsed().as_secs_f64() * 1_000.0);
+                        stats.acknowledged.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Ok((_, Err(error)))) => {
+                        eprintln!("{writer_name} autotuned append refused: {error}");
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(Err(join)) => {
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("{writer_name} autotuned task failed: {join}");
+                    }
+                    None => break,
+                }
+            }
+        }
+        if let Err(error) = pumped.flush().await {
+            eprintln!("{writer_name} autotuned flush failed: {error}");
+        }
+        return;
+    }
     while sent < share {
         let take = batch.min(share - sent);
         // Shared request_ids across attempts: a retry after an
@@ -186,6 +246,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payload_bytes = env_u64("BENCH_BYTES", 1024) as usize;
     let writers = env_u64("BENCH_WRITERS", 4) as usize;
     let batch = env_u64("BENCH_BATCH", 50);
+    let autotune = env_u64("BENCH_AUTOTUNE", 0) != 0;
+    let tune = whitewater::AutoTune {
+        max_batch: env_u64("BENCH_MAX_BATCH", 512) as usize,
+        max_in_flight: env_u64("BENCH_IN_FLIGHT", 2) as usize,
+        initial_batch: env_u64("BENCH_MAX_BATCH", 512) as usize,
+        ..whitewater::AutoTune::default()
+    };
     let feeds = env_u64("BENCH_FEEDS", 1) as usize;
     let page_limit = env_u64("BENCH_PAGE_LIMIT", 65_536);
     let binary_read = env_str("BENCH_READ_FORMAT", "binary") == "binary";
@@ -263,11 +330,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handles.push(tokio::spawn(write_worker(
                 client.clone(),
                 writer_names[index].clone(),
-                shares[index],
-                batch,
-                payload.clone(),
-                // disjoint key namespace per worker
-                records_total * 1_000 + index as u64 * records_total,
+                WriteWork {
+                    autotuned: autotune.then_some(tune),
+                    share: shares[index],
+                    batch,
+                    payload: payload.clone(),
+                    // disjoint key namespace per worker
+                    base_index: records_total * 1_000 + index as u64 * records_total,
+                },
                 stats.clone(),
             )));
         }
