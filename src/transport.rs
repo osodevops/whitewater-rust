@@ -15,6 +15,15 @@ pub struct TransportReply {
     pub body: Value,
 }
 
+/// Result of one binary HTTP exchange (e.g. `Accept:
+/// application/vnd.whitewater.frames` on fetch): raw body bytes; a
+/// non-2xx status still carries the server's JSON error body.
+#[derive(Clone, Debug)]
+pub struct TransportBytesReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 /// The wire seam: one request/response against one Node base URL.
 /// Implementations must not retry internally — ambiguity handling is the
 /// SDK's contract.
@@ -28,6 +37,22 @@ pub trait Transport: Send + Sync {
         body: Option<&Value>,
         api_key: &str,
     ) -> Result<TransportReply, SdkError>;
+
+    /// Binary-body exchange — `Accept: application/vnd.whitewater.frames`
+    /// on the request, raw bytes on success, the server's JSON error
+    /// body otherwise. The default refuses so JSON-only test transports
+    /// keep compiling unchanged.
+    async fn request_binary(
+        &self,
+        _base: &str,
+        _path: &str,
+        _body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportBytesReply, SdkError> {
+        Err(SdkError::Refused(
+            "binary fetch is not supported by this Transport".to_owned(),
+        ))
+    }
 }
 
 /// Production reqwest transport over rustls. `request_timeout` bounds
@@ -78,5 +103,35 @@ impl Transport for HttpTransport {
         let status = response.status().as_u16();
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
         Ok(TransportReply { status, body })
+    }
+
+    async fn request_binary(
+        &self,
+        base: &str,
+        path: &str,
+        body: Option<&Value>,
+        api_key: &str,
+    ) -> Result<TransportBytesReply, SdkError> {
+        let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let builder = self
+            .client
+            .post(&url)
+            .bearer_auth(api_key)
+            .header(reqwest::header::ACCEPT, "application/vnd.whitewater.frames");
+        let builder = match body {
+            Some(value) => builder.json(value),
+            None => builder,
+        };
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| SdkError::Transport(error.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| SdkError::Transport(error.to_string()))?
+            .to_vec();
+        Ok(TransportBytesReply { status, body })
     }
 }

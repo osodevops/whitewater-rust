@@ -116,6 +116,35 @@ impl Client {
         Err(last)
     }
 
+    /// Binary sibling of [`Client::call`]: the same endpoint-pool
+    /// failover, but the reply body is raw bytes (the
+    /// `application/vnd.whitewater.frames` fetch format). Non-2xx
+    /// replies still carry a JSON error body and map through
+    /// [`map_error`] identically.
+    pub(crate) async fn call_binary(
+        &self,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Vec<u8>, SdkError> {
+        let mut last = SdkError::Transport("no Node attempted".to_owned());
+        for _ in 0..self.bases.len() {
+            let base = self.base().to_owned();
+            match self
+                .transport
+                .request_binary(&base, path, body, &self.api_key)
+                .await
+            {
+                Ok(reply) if (200..300).contains(&reply.status) => return Ok(reply.body),
+                Ok(reply) => {
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+                    return Err(map_error(reply.status, &body));
+                }
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
     /// Raw protocol escape hatch for ops without a typed façade — the
     /// same endpoint pool, bearer auth, and transport failure policy as
     /// every call, but the caller owns argument encoding and reads the
@@ -615,6 +644,40 @@ impl Client {
                 .get("next_cursor")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+        })
+    }
+
+    /// [`Client::temporary_fetch`] on the binary wire: identical
+    /// request and page semantics, but the reply streams stored record
+    /// frames (`application/vnd.whitewater.frames`) and the SDK decodes
+    /// them — a bulk replay never pays server-side base64 + JSON
+    /// encode/decode. The records are the same [`Record`]s a JSON page
+    /// returns.
+    pub async fn temporary_fetch_frames(
+        &self,
+        feed: &str,
+        options: TemporaryFetch,
+    ) -> Result<TemporaryPage, SdkError> {
+        let bytes = self
+            .call_binary(
+                "/v1/readers/temporary/fetch",
+                Some(&json!({
+                    "feed": feed,
+                    "after": options.after,
+                    "limit": options.limit,
+                    "new_only": options.new_only,
+                    "tail": options.tail,
+                    "wait_ms": options.wait_ms,
+                    "after_event_time_ns": options
+                        .after_event_time_ns
+                        .map(|nanos| nanos.to_string()),
+                })),
+            )
+            .await?;
+        let (records, next_cursor) = crate::frame::parse_frame_page(&bytes)?;
+        Ok(TemporaryPage {
+            records,
+            next_cursor,
         })
     }
 

@@ -47,6 +47,7 @@ mod demand;
 mod domain;
 mod error;
 mod feed;
+mod frame;
 mod member;
 mod model;
 mod pipe;
