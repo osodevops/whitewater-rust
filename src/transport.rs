@@ -54,10 +54,41 @@ pub trait Transport: Send + Sync {
         ))
     }
 
-    /// Binary request body — `Content-Type:
-    /// application/vnd.whitewater.frames`, raw FSA1 append frames out,
-    /// the JSON outcome back. The default refuses so JSON-only test
-    /// transports keep compiling unchanged.
+    /// Fetch one binary records page. `HttpTransport` streams and
+    /// decodes incrementally; the default keeps scripted transports
+    /// working by falling back to `request_binary` + whole-buffer parse.
+    /// `on_header` receives the page's `next_cursor` as soon as the
+    /// response header is parsed — `HttpTransport` fires it mid-stream so
+    /// cursor-chained prefetch overlaps the body; the default fires it
+    /// after the whole page is parsed.
+    async fn request_frame_page(
+        &self,
+        base: &str,
+        path: &str,
+        body: Option<&Value>,
+        api_key: &str,
+        on_header: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    ) -> Result<TransportFramePageReply, SdkError> {
+        let reply = self.request_binary(base, path, body, api_key).await?;
+        if (200..300).contains(&reply.status) {
+            let page = crate::frame::parse_frame_page(&reply.body)?;
+            if let Some(tx) = on_header {
+                let _ = tx.send(page.1.clone());
+            }
+            Ok(TransportFramePageReply {
+                status: reply.status,
+                page: Some(page),
+                body: Vec::new(),
+            })
+        } else {
+            Ok(TransportFramePageReply {
+                status: reply.status,
+                page: None,
+                body: reply.body,
+            })
+        }
+    }
+
     async fn request_binary_body(
         &self,
         _base: &str,
@@ -69,6 +100,14 @@ pub trait Transport: Send + Sync {
             "binary append is not supported by this Transport".to_owned(),
         ))
     }
+}
+
+/// One frame-page exchange: the status line plus, on success, the
+/// incrementally decoded page; on error the raw JSON body.
+pub struct TransportFramePageReply {
+    pub status: u16,
+    pub page: Option<(Vec<crate::model::Record>, Option<String>)>,
+    pub body: Vec<u8>,
 }
 
 /// Production reqwest transport over rustls. `request_timeout` bounds
@@ -86,6 +125,8 @@ impl HttpTransport {
     pub fn with_timeout(timeout: Duration) -> Result<Self, SdkError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(64)
             .build()
             .map_err(|error| SdkError::Transport(error.to_string()))?;
         Ok(Self { client })
@@ -112,10 +153,13 @@ impl Transport for HttpTransport {
             Some(value) => builder.json(value),
             None => builder,
         };
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| SdkError::Transport(error.to_string()))?;
+        let response = builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                SdkError::Transport(format!("timeout: {url}"))
+            } else {
+                SdkError::Transport(error.to_string())
+            }
+        })?;
         let status = response.status().as_u16();
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
         Ok(TransportReply { status, body })
@@ -138,10 +182,13 @@ impl Transport for HttpTransport {
             Some(value) => builder.json(value),
             None => builder,
         };
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| SdkError::Transport(error.to_string()))?;
+        let response = builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                SdkError::Transport(format!("timeout: {url}"))
+            } else {
+                SdkError::Transport(error.to_string())
+            }
+        })?;
         let status = response.status().as_u16();
         let body = response
             .bytes()
@@ -170,9 +217,80 @@ impl Transport for HttpTransport {
             .body(body.to_vec())
             .send()
             .await
-            .map_err(|error| SdkError::Transport(error.to_string()))?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    SdkError::Transport(format!("timeout: {url}"))
+                } else {
+                    SdkError::Transport(error.to_string())
+                }
+            })?;
         let status = response.status().as_u16();
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
         Ok(TransportReply { status, body })
+    }
+
+    async fn request_frame_page(
+        &self,
+        base: &str,
+        path: &str,
+        body: Option<&Value>,
+        api_key: &str,
+        on_header: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    ) -> Result<TransportFramePageReply, SdkError> {
+        let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let builder = self
+            .client
+            .post(&url)
+            .bearer_auth(api_key)
+            .header(reqwest::header::ACCEPT, "application/vnd.whitewater.frames");
+        let builder = match body {
+            Some(value) => builder.json(value),
+            None => builder,
+        };
+        let response = builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                SdkError::Transport(format!("timeout: {url}"))
+            } else {
+                SdkError::Transport(error.to_string())
+            }
+        })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| SdkError::Transport(error.to_string()))?
+                .to_vec();
+            return Ok(TransportFramePageReply {
+                status,
+                page: None,
+                body,
+            });
+        }
+        // Incremental decode: each record parses as soon as its bytes
+        // land, so decode overlaps the transfer. The next_cursor is
+        // delivered the moment the header completes so a pipelined
+        // caller can launch the next page now.
+        let mut parser = crate::frame::FramePageParser::new();
+        let mut on_header = on_header;
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| SdkError::Transport(error.to_string()))?
+        {
+            parser.feed(&chunk)?;
+            if on_header.is_some() && parser.header_ready() {
+                if let Some(tx) = on_header.take() {
+                    let _ = tx.send(parser.next_cursor());
+                }
+            }
+        }
+        let page = parser.finish()?;
+        Ok(TransportFramePageReply {
+            status,
+            page: Some(page),
+            body: Vec::new(),
+        })
     }
 }

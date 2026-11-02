@@ -198,25 +198,30 @@ impl Client {
         }
     }
 
-    /// Binary sibling of [`Client::call`]: the same endpoint-pool
-    /// failover, but the reply body is raw bytes (the
-    /// `application/vnd.whitewater.frames` fetch format). Non-2xx
-    /// replies still carry a JSON error body and map through
-    /// [`map_error`] identically.
-    pub(crate) async fn call_binary(
+    /// `call_binary` for frame pages: same base rotation and error
+    /// mapping, decoded through the transport's streaming parser when
+    /// available (whole-buffer fallback otherwise). `on_header` fires
+    /// with the page's next_cursor as early as the transport can parse
+    /// the header.
+    pub(crate) async fn call_frame_page(
         &self,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<Vec<u8>, SdkError> {
+        mut on_header: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    ) -> Result<(Vec<crate::model::Record>, Option<String>), SdkError> {
         let mut last = SdkError::Transport("no Node attempted".to_owned());
         for _ in 0..self.bases.len() {
             let base = self.base().to_owned();
             match self
                 .transport
-                .request_binary(&base, path, body, &self.api_key)
+                .request_frame_page(&base, path, body, &self.api_key, on_header.take())
                 .await
             {
-                Ok(reply) if (200..300).contains(&reply.status) => return Ok(reply.body),
+                Ok(reply) if (200..300).contains(&reply.status) => {
+                    return reply.page.ok_or_else(|| {
+                        SdkError::Protocol("binary fetch page corrupt: missing page".to_owned())
+                    })
+                }
                 Ok(reply) => {
                     let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
                     return Err(map_error(reply.status, &body));
@@ -748,8 +753,8 @@ impl Client {
         feed: &str,
         options: TemporaryFetch,
     ) -> Result<TemporaryPage, SdkError> {
-        let bytes = self
-            .call_binary(
+        let (records, next_cursor) = self
+            .call_frame_page(
                 "/v1/readers/temporary/fetch",
                 Some(&json!({
                     "feed": feed,
@@ -762,13 +767,41 @@ impl Client {
                         .after_event_time_ns
                         .map(|nanos| nanos.to_string()),
                 })),
+                None,
             )
             .await?;
-        let (records, next_cursor) = crate::frame::parse_frame_page(&bytes)?;
         Ok(TemporaryPage {
             records,
             next_cursor,
         })
+    }
+
+    /// Pipelined variant of [`Client::temporary_fetch_frames`]: an
+    /// async iterator that issues the request for page k+1 — whose
+    /// `after` cursor is already known from page k's header — while the
+    /// caller drains page k. `depth` bounds in-flight prefetching
+    /// (page cursors chain serially, so >1 has no additional pages to
+    /// launch; 0 behaves like the sequential call). Pages yield in
+    /// order; an error or an empty page (with no `wait_ms`) ends the
+    /// stream.
+    pub fn temporary_fetch_frames_pipelined(
+        &self,
+        feed: &str,
+        options: TemporaryFetch,
+        depth: usize,
+    ) -> TemporaryFramePageStream {
+        TemporaryFramePageStream {
+            shared: std::sync::Arc::new(FramePageShared {
+                client: self.clone(),
+                feed: feed.to_owned(),
+                template: options,
+                depth: depth.max(1),
+                pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                open: std::sync::Mutex::new(0),
+                done: std::sync::atomic::AtomicBool::new(false),
+            }),
+            done: false,
+        }
     }
 
     /// Query a declared persisted Index. `mode` selects exact,
@@ -824,5 +857,148 @@ impl Client {
             .call("POST", "/v1/indexes/query", Some(&request))
             .await?;
         decode_index_page(&body)
+    }
+}
+
+/// The page stream returned by [`Client::temporary_fetch_frames_pipelined`]:
+/// poll [`next`](Self::next) like a manual `Stream`.
+pub struct TemporaryFramePageStream {
+    shared: std::sync::Arc<FramePageShared>,
+    done: bool,
+}
+
+type SpawnedPage =
+    tokio::task::JoinHandle<Result<(Vec<crate::model::Record>, Option<String>), SdkError>>;
+
+struct FramePageShared {
+    client: Client,
+    feed: String,
+    template: TemporaryFetch,
+    depth: usize,
+    pending: std::sync::Mutex<std::collections::VecDeque<SpawnedPage>>,
+    open: std::sync::Mutex<usize>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl FramePageShared {
+    fn spawn_page(self: &std::sync::Arc<Self>, after: Option<String>) {
+        if self.done.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let mut open = self.open.lock().expect("prefetch slot");
+        if *open >= self.depth {
+            return;
+        }
+        *open += 1;
+        drop(open);
+        let shared = self.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut options = self.template.clone();
+        options.after = after;
+        let client = self.client.clone();
+        let feed = self.feed.clone();
+        let handle = tokio::spawn(async move {
+            let body = json!({
+                "feed": feed,
+                "after": options.after,
+                "limit": options.limit,
+                "new_only": options.new_only,
+                "tail": options.tail,
+                "wait_ms": options.wait_ms,
+                "after_event_time_ns": options
+                    .after_event_time_ns
+                    .map(|nanos| nanos.to_string()),
+            });
+            client
+                .call_frame_page("/v1/readers/temporary/fetch", Some(&body), Some(tx))
+                .await
+        });
+        self.pending
+            .lock()
+            .expect("pending pages")
+            .push_back(handle);
+        // The page's next_cursor arrives while its body still streams —
+        // chain the next request immediately.
+        let shared = shared;
+        tokio::spawn(async move {
+            if let Ok(Some(cursor)) = rx.await {
+                shared.spawn_page(Some(cursor));
+            }
+        });
+    }
+
+    fn release_slot(&self) {
+        let mut open = self.open.lock().expect("prefetch slot");
+        *open = open.saturating_sub(1);
+    }
+}
+
+impl TemporaryFramePageStream {
+    /// The next page in order, or `None` at the tip/after an error.
+    pub async fn next(&mut self) -> Option<Result<TemporaryPage, SdkError>> {
+        if self.done {
+            return None;
+        }
+        {
+            let pending = self.shared.pending.lock().expect("pending pages");
+            if pending.is_empty() {
+                drop(pending);
+                self.shared.spawn_page(self.shared.template.after.clone());
+            }
+        }
+        let handle = {
+            let mut pending = self.shared.pending.lock().expect("pending pages");
+            pending.pop_front()
+        };
+        let Some(handle) = handle else {
+            self.done = true;
+            return None;
+        };
+        let (records, next_cursor) = match handle.await {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => {
+                self.done = true;
+                self.shared
+                    .done
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Some(Err(error));
+            }
+            Err(join) => {
+                self.done = true;
+                self.shared
+                    .done
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                return Some(Err(SdkError::Transport(format!("page task: {join}"))));
+            }
+        };
+        self.shared.release_slot();
+        if records.is_empty() && self.shared.template.wait_ms.is_none() {
+            self.done = true;
+            self.shared
+                .done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if next_cursor.is_none() {
+            self.done = true;
+            self.shared
+                .done
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Some(Ok(TemporaryPage {
+            records,
+            next_cursor,
+        }))
+    }
+}
+
+impl Drop for TemporaryFramePageStream {
+    fn drop(&mut self) {
+        self.shared
+            .done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = self.shared.pending.lock().expect("pending pages");
+        for handle in pending.drain(..) {
+            handle.abort();
+        }
     }
 }

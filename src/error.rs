@@ -22,6 +22,9 @@ pub enum SdkError {
     Ambiguous(String),
     /// Quorum/replica unavailable: safe to retry the identical request.
     Unavailable(String),
+    /// The request body exceeded the server's posted byte budget:
+    /// shrink the batch; an identical retry can never succeed.
+    PayloadTooLarge(String),
     /// `index_behind`: strict freshness could not be reached inside the
     /// bounded wait; the read may be retried.
     IndexBehind,
@@ -64,6 +67,9 @@ impl std::fmt::Display for SdkError {
             SdkError::Conflict(detail) => write!(f, "conflict: {detail}"),
             SdkError::Ambiguous(detail) => write!(f, "ambiguous outcome: {detail}"),
             SdkError::Unavailable(detail) => write!(f, "unavailable: {detail}"),
+            SdkError::PayloadTooLarge(detail) => {
+                write!(f, "payload too large: {detail}")
+            }
             SdkError::IndexBehind => {
                 write!(f, "index has not reached the requested freshness")
             }
@@ -96,6 +102,7 @@ pub(crate) fn map_error(status: u16, body: &Value) -> SdkError {
         (409, Some("lease.capacity")) => SdkError::LeaseCapacity,
         (409, Some("index_behind")) => SdkError::IndexBehind,
         (409, _) => SdkError::Conflict(detail),
+        (413, _) => SdkError::PayloadTooLarge(detail),
         (503, _) => SdkError::Unavailable(detail),
         _ if status >= 500 => SdkError::Ambiguous(detail),
         _ => SdkError::Refused(format!("{status}: {detail}")),

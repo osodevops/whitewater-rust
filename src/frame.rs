@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 
+use bytes::Buf;
+
 use uuid::Uuid;
 
 use crate::error::SdkError;
@@ -206,6 +208,172 @@ pub(crate) fn parse_frame_page(bytes: &[u8]) -> Result<(Vec<Record>, Option<Stri
     ))
 }
 
+/// Incremental [`parse_frame_page`]: feeds the same page envelope one
+/// arbitrary chunk at a time and decodes each record as soon as its
+/// bytes complete, so decode overlaps the transfer instead of waiting
+/// for the whole body. `finish` enforces the same fail-closed contract
+/// as the whole-buffer parse: exact completion, no trailing bytes.
+pub(crate) struct FramePageParser {
+    buffer: bytes::BytesMut,
+    stage: FramePageStage,
+    count: u32,
+    next_cursor: Vec<u8>,
+    pending_cursor: String,
+    records: Vec<Record>,
+}
+
+#[derive(Clone)]
+enum FramePageStage {
+    Count,
+    NextCursorLen,
+    NextCursor(usize),
+    CursorLen,
+    Cursor(usize),
+    FrameLen,
+    Frame(usize),
+    Done,
+}
+
+impl FramePageParser {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffer: bytes::BytesMut::new(),
+            stage: FramePageStage::Count,
+            count: 0,
+            next_cursor: Vec::new(),
+            pending_cursor: String::new(),
+            records: Vec::new(),
+        }
+    }
+
+    /// The page header (count + next_cursor) has been fully parsed:
+    /// callers can already launch the cursor-chained next request while
+    /// record frames are still streaming.
+    pub(crate) fn header_ready(&self) -> bool {
+        !matches!(
+            self.stage,
+            FramePageStage::Count | FramePageStage::NextCursorLen | FramePageStage::NextCursor(_)
+        )
+    }
+
+    /// The parsed `next_cursor` once [`header_ready`](Self::header_ready)
+    /// is true (`None` for an empty cursor).
+    pub(crate) fn next_cursor(&self) -> Option<String> {
+        String::from_utf8(self.next_cursor.clone())
+            .ok()
+            .filter(|cursor| !cursor.is_empty())
+    }
+
+    /// Feed one network chunk; any boundary — inside the page header,
+    /// a record header, or a frame — is legal.
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<(), SdkError> {
+        self.buffer.extend_from_slice(chunk);
+        self.drain()
+    }
+
+    /// The stream ended: the page must have completed exactly, with no
+    /// partial field or trailing byte.
+    pub(crate) fn finish(mut self) -> Result<(Vec<Record>, Option<String>), SdkError> {
+        self.drain()?;
+        match self.stage {
+            FramePageStage::Done if self.buffer.is_empty() => {
+                let next_cursor = std::str::from_utf8(&self.next_cursor)
+                    .map_err(|_| corrupt("next cursor utf8"))?;
+                Ok((
+                    self.records,
+                    (!next_cursor.is_empty()).then(|| next_cursor.to_owned()),
+                ))
+            }
+            FramePageStage::Done => Err(corrupt("trailing bytes in page")),
+            _ => Err(corrupt("truncated page")),
+        }
+    }
+
+    fn drain(&mut self) -> Result<(), SdkError> {
+        loop {
+            match self.stage.clone() {
+                FramePageStage::Count => {
+                    if self.buffer.len() < 4 {
+                        return Ok(());
+                    }
+                    let count = u32::from_le_bytes(self.buffer[..4].try_into().expect("u32"));
+                    if count > MAX_PAGE_RECORDS {
+                        return Err(corrupt("record count exceeds page bound"));
+                    }
+                    self.count = count;
+                    self.records.reserve(count as usize);
+                    self.buffer.advance(4);
+                    self.stage = FramePageStage::NextCursorLen;
+                }
+                FramePageStage::NextCursorLen => {
+                    if self.buffer.len() < 4 {
+                        return Ok(());
+                    }
+                    let len =
+                        u32::from_le_bytes(self.buffer[..4].try_into().expect("u32")) as usize;
+                    self.buffer.advance(4);
+                    self.stage = FramePageStage::NextCursor(len);
+                }
+                FramePageStage::NextCursor(len) => {
+                    if self.buffer.len() < len {
+                        return Ok(());
+                    }
+                    let raw = self.buffer.split_to(len);
+                    std::str::from_utf8(&raw).map_err(|_| corrupt("next cursor utf8"))?;
+                    self.next_cursor = raw.to_vec();
+                    self.stage = FramePageStage::CursorLen;
+                }
+                FramePageStage::CursorLen => {
+                    if self.records.len() == self.count as usize {
+                        self.stage = FramePageStage::Done;
+                        continue;
+                    }
+                    if self.buffer.len() < 4 {
+                        return Ok(());
+                    }
+                    let len =
+                        u32::from_le_bytes(self.buffer[..4].try_into().expect("u32")) as usize;
+                    self.buffer.advance(4);
+                    self.stage = FramePageStage::Cursor(len);
+                }
+                FramePageStage::Cursor(len) => {
+                    if self.buffer.len() < len {
+                        return Ok(());
+                    }
+                    let raw = self.buffer.split_to(len);
+                    self.pending_cursor = std::str::from_utf8(&raw)
+                        .map_err(|_| corrupt("record cursor utf8"))?
+                        .to_owned();
+                    self.stage = FramePageStage::FrameLen;
+                }
+                FramePageStage::FrameLen => {
+                    if self.buffer.len() < 4 {
+                        return Ok(());
+                    }
+                    let len =
+                        u32::from_le_bytes(self.buffer[..4].try_into().expect("u32")) as usize;
+                    if len > MAX_FRAME_BYTES + 8 {
+                        return Err(corrupt("frame length exceeds bound"));
+                    }
+                    self.buffer.advance(4);
+                    self.stage = FramePageStage::Frame(len);
+                }
+                FramePageStage::Frame(len) => {
+                    if self.buffer.len() < len {
+                        return Ok(());
+                    }
+                    let frame = self.buffer.split_to(len);
+                    let mut record = decode_frame(&frame)?;
+                    record.cursor = Some(std::mem::take(&mut self.pending_cursor));
+                    self.records.push(record);
+                    self.stage = FramePageStage::CursorLen;
+                }
+                FramePageStage::Done => return Ok(()),
+            }
+        }
+    }
+}
+
 /// Client-side `FSA1` append record — the binary form of one
 /// `WriterSessionAppendRequest` (server mints identity/sequence/
 /// ingest-time downstream).
@@ -363,6 +531,7 @@ mod tests {
         let page = encode_page(&[("c".to_owned(), bad)], None);
         assert!(parse_frame_page(&page).is_err());
         assert!(parse_frame_page(&[]).is_err());
+
         let mut truncated = encode_page(
             &[(
                 "c".to_owned(),
@@ -372,5 +541,54 @@ mod tests {
         );
         truncated.truncate(truncated.len() - 3);
         assert!(parse_frame_page(&truncated).is_err());
+    }
+
+    #[test]
+    fn incremental_parse_matches_whole_buffer_at_every_boundary() {
+        let records = vec![
+            (
+                "c-1".to_owned(),
+                encode_v2(
+                    b"key-1",
+                    b"payload-1",
+                    &BTreeMap::from([("a".to_owned(), b"1".to_vec())]),
+                    11,
+                    12,
+                ),
+            ),
+            (
+                "c-2".to_owned(),
+                encode_v2(b"key-2", &vec![7u8; 300], &BTreeMap::new(), 21, 22),
+            ),
+            (
+                "c-3".to_owned(),
+                encode_v2(b"k", b"", &BTreeMap::new(), 31, 32),
+            ),
+        ];
+        let page = encode_page(&records, Some("cursor-9"));
+        let (expected_records, expected_next) = parse_frame_page(&page).expect("page");
+        for split in [1usize, 3, 7, 64, 4096] {
+            let mut parser = FramePageParser::new();
+            for chunk in page.chunks(split) {
+                parser.feed(chunk).expect("feed");
+            }
+            let (records, next) = parser.finish().expect("finish");
+            assert_eq!(records, expected_records, "split {split}");
+            assert_eq!(next, expected_next, "split {split}");
+        }
+        // Corrupt + truncated + trailing streams all fail closed.
+        let mut torn = page.clone();
+        let mid = torn.len() / 2;
+        torn[mid] ^= 0xFF;
+        let mut parser = FramePageParser::new();
+        let outcome = parser.feed(&torn).and_then(|_| parser.finish()).map(|_| ());
+        assert!(outcome.is_err());
+        let mut parser = FramePageParser::new();
+        parser.feed(&page[..page.len() - 3]).expect("feed");
+        assert!(parser.finish().is_err());
+        let mut parser = FramePageParser::new();
+        parser.feed(&page).expect("feed");
+        parser.feed(&[0xAA]).expect("extra");
+        assert!(parser.finish().is_err());
     }
 }

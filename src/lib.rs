@@ -77,7 +77,7 @@ pub use store::{
     GetByPage, IteratePage, LookupOutcome, MutationOutcome, ReadFreshness, StateStore, StoreRow,
     SyncOutcome,
 };
-pub use transport::{HttpTransport, Transport, TransportReply};
+pub use transport::{HttpTransport, Transport, TransportBytesReply, TransportReply};
 pub use typed::{IndexBound, IndexPage, IndexQuery, TypedValue};
 pub use typed_store::{IterateRows, Lookup, Row, RowPage, Store};
-pub use writer::{PumpedWriter, Writer};
+pub use writer::{AppendItem, PumpedWriter, Writer};

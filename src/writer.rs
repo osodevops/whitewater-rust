@@ -77,6 +77,11 @@ impl Writer {
         decode_append_outcome(&body)
     }
 
+    /// The Node base URL this Writer's session is currently pinned to.
+    pub fn pinned_base(&self) -> String {
+        self.pinned.lock().expect("pinned base").clone()
+    }
+
     /// Opt into binary `FSA1` append frames on `append_batch`: the
     /// request body ships `application/vnd.whitewater.frames` instead
     /// of JSON+base64 — ~25% less wire and no serde pass either side.
@@ -90,24 +95,62 @@ impl Writer {
     }
 
     /// Append a batch as one request; per-record `request_id`s keep the
-    /// same retry contract as `append`.
+    /// same retry contract as `append`. Records carry no Metadata —
+    /// [`Writer::append_items`] is the form that ships it.
     pub async fn append_batch(
         &self,
         records: &[(Uuid, Vec<u8>, Vec<u8>, i64)],
     ) -> Result<Vec<AppendOutcome>, SdkError> {
-        if self.binary_appends {
-            return self.append_batch_binary(records).await;
-        }
-        let items: Vec<serde_json::Value> = records
+        let items: Vec<AppendItem> = records
             .iter()
-            .map(|(request_id, key, payload, event_time_ns)| {
+            .map(|(request_id, key, payload, event_time_ns)| AppendItem {
+                request_id: *request_id,
+                key: key.clone(),
+                payload: payload.clone(),
+                event_time_ns: *event_time_ns,
+                metadata: BTreeMap::new(),
+            })
+            .collect();
+        self.append_items(&items).await
+    }
+
+    /// Append a batch with per-record Metadata — the same wire contract
+    /// as [`Writer::append_batch`], on both the JSON and `FSA1` paths.
+    /// When the server refuses the body as too large
+    /// ([`SdkError::PayloadTooLarge`]) the batch splits in half and each
+    /// half retries in order, so oversized runs still commit.
+    pub async fn append_items(&self, items: &[AppendItem]) -> Result<Vec<AppendOutcome>, SdkError> {
+        match self.append_items_once(items).await {
+            Err(SdkError::PayloadTooLarge(_)) if items.len() > 1 => {
+                let half = items.len() / 2;
+                // Boxed recursion: halving bounds the depth at log2(n).
+                let mut outcomes = Box::pin(self.append_items(&items[..half])).await?;
+                outcomes.extend(Box::pin(self.append_items(&items[half..])).await?);
+                Ok(outcomes)
+            }
+            other => other,
+        }
+    }
+
+    async fn append_items_once(
+        &self,
+        items: &[AppendItem],
+    ) -> Result<Vec<AppendOutcome>, SdkError> {
+        if self.binary_appends {
+            return self.append_batch_binary(items).await;
+        }
+        let records: Vec<serde_json::Value> = items
+            .iter()
+            .map(|item| {
                 json!({
-                    "request_id": request_id.to_string(),
+                    "request_id": item.request_id.to_string(),
                     "writer": self.name,
                     "session_epoch": self.session_epoch,
-                    "event_time_ns": event_time_ns.to_string(),
-                    "key_base64": STANDARD.encode(key),
-                    "payload_base64": STANDARD.encode(payload),
+                    "event_time_ns": item.event_time_ns.to_string(),
+                    "key_base64": STANDARD.encode(&item.key),
+                    "payload_base64": STANDARD.encode(&item.payload),
+                    "metadata_base64": metadata_base64(&item.metadata),
+                    "use_compression": self.client.use_compression,
                 })
             })
             .collect();
@@ -117,7 +160,7 @@ impl Writer {
                 &self.pinned,
                 "POST",
                 "/v1/writers/append-batch",
-                Some(&json!({ "records": items })),
+                Some(&json!({ "records": records })),
             )
             .await?;
         let outcomes = body
@@ -129,26 +172,24 @@ impl Writer {
         outcomes.iter().map(decode_append_outcome).collect()
     }
 
-    /// `FSA1` wire form of [`Writer::append_batch`] — same request/response
-    /// contract, frames instead of JSON.
+    /// `FSA1` wire form of [`Writer::append_items`] — same
+    /// request/response contract, frames instead of JSON.
     async fn append_batch_binary(
         &self,
-        records: &[(Uuid, Vec<u8>, Vec<u8>, i64)],
+        items: &[AppendItem],
     ) -> Result<Vec<AppendOutcome>, SdkError> {
-        let frames: Vec<crate::frame::AppendFrame<'_>> = records
+        let frames: Vec<crate::frame::AppendFrame<'_>> = items
             .iter()
-            .map(
-                |(request_id, key, payload, event_time_ns)| crate::frame::AppendFrame {
-                    writer: &self.name,
-                    request_id: *request_id,
-                    session_epoch: self.session_epoch,
-                    event_time_ns: Some(*event_time_ns),
-                    use_compression: false,
-                    key,
-                    payload,
-                    metadata: &NO_METADATA,
-                },
-            )
+            .map(|item| crate::frame::AppendFrame {
+                writer: &self.name,
+                request_id: item.request_id,
+                session_epoch: self.session_epoch,
+                event_time_ns: Some(item.event_time_ns),
+                use_compression: self.client.use_compression,
+                key: &item.key,
+                payload: &item.payload,
+                metadata: &item.metadata,
+            })
             .collect();
         let body = self
             .client
@@ -166,8 +207,16 @@ impl Writer {
     }
 }
 
-static NO_METADATA: std::sync::LazyLock<BTreeMap<String, Vec<u8>>> =
-    std::sync::LazyLock::new(BTreeMap::new);
+/// One record in a [`Writer::append_items`] batch: the same fields
+/// [`Writer::append`] carries, including per-record Metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendItem {
+    pub request_id: Uuid,
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub event_time_ns: i64,
+    pub metadata: BTreeMap<String, Vec<u8>>,
+}
 
 /// Request-side knobs for [`Writer::batched`] / [`Writer::autotuned`].
 pub use crate::autotune::{AutoTune, Batching};
@@ -242,6 +291,14 @@ impl Tuner {
 
 fn spawn_pump(writer: Writer, mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>, tuner: Tuner) {
     let in_flight = Arc::new(AtomicUsize::new(0));
+    // Keys already committed to a spawned batch: no second batch may
+    // carry the same Key while one is in flight (per-Key order). The
+    // pump owns formation; completion tasks decrement on the way out.
+    let in_flight_keys = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        Vec<u8>,
+        usize,
+    >::new()));
+    let completed = Arc::new(tokio::sync::Notify::new());
     let tuner = Arc::new(tuner);
     tokio::spawn(async move {
         let mut queue: std::collections::VecDeque<Op> = std::collections::VecDeque::new();
@@ -260,10 +317,56 @@ fn spawn_pump(writer: Writer, mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>, 
                 .unwrap_or_default();
             match tuner.evaluate(queue.len(), oldest_age, in_flight.load(Ordering::Relaxed)) {
                 crate::autotune::Flush::Now => {
-                    let take = tuner.cap().min(queue.len());
-                    let mut batch = Vec::with_capacity(take);
-                    let mut senders = Vec::with_capacity(take);
-                    for op in queue.drain(..take) {
+                    let cap = tuner.cap();
+                    let mut batch_ops = Vec::with_capacity(cap.min(queue.len()));
+                    // Front-to-back: take ops whose Key is not in flight;
+                    // an op skipped for capacity or a blocked Key stays
+                    // queued in order, and later ops with a blocked Key
+                    // hit the same flying entry — no overtaking.
+                    {
+                        let mut flying = in_flight_keys.lock().expect("in-flight keys");
+                        // Takeable iff the key was not in flight when the
+                        // scan started AND it has not been skipped earlier
+                        // in this scan. Keys claimed by THIS batch keep
+                        // queue order inside the batch — duplicates are
+                        // fine — and each new key is claimed exactly once.
+                        let mut newly_claimed = std::collections::HashSet::new();
+                        let mut skipped = std::collections::HashSet::new();
+                        let mut kept = std::collections::VecDeque::with_capacity(queue.len());
+                        for op in std::mem::take(&mut queue) {
+                            if batch_ops.len() < cap
+                                && !skipped.contains(&op.key)
+                                && (newly_claimed.contains(&op.key)
+                                    || !flying.contains_key(&op.key))
+                            {
+                                newly_claimed.insert(op.key.clone());
+                                batch_ops.push(op);
+                            } else {
+                                skipped.insert(op.key.clone());
+                                kept.push_back(op);
+                            }
+                        }
+                        for key in newly_claimed {
+                            *flying.entry(key).or_insert(0) += 1;
+                        }
+                        queue = kept;
+                    }
+                    if batch_ops.is_empty() {
+                        // Everything queued is key-blocked: wait for a
+                        // completion or new work instead of spinning.
+                        tokio::select! {
+                            op = rx.recv() => match op {
+                                Some(op) if op.request_id.is_nil() => closed = true,
+                                Some(op) => queue.push_back(op),
+                                None => closed = true,
+                            },
+                            _ = completed.notified() => {},
+                        }
+                        continue;
+                    }
+                    let mut batch = Vec::with_capacity(batch_ops.len());
+                    let mut senders = Vec::with_capacity(batch_ops.len());
+                    for op in batch_ops {
                         senders.push(op.done);
                         batch.push((op.request_id, op.key, op.payload, op.event_time_ns));
                     }
@@ -271,13 +374,32 @@ fn spawn_pump(writer: Writer, mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>, 
                     let writer = writer.clone();
                     let in_flight = in_flight.clone();
                     let tuner = tuner.clone();
+                    let in_flight_keys = in_flight_keys.clone();
+                    let completed = completed.clone();
+                    let batch_keys: Vec<Vec<u8>> = {
+                        let mut seen = std::collections::HashSet::new();
+                        batch
+                            .iter()
+                            .filter(|&(_, key, _, _)| seen.insert(key.clone()))
+                            .map(|(_, key, _, _)| key.clone())
+                            .collect()
+                    };
                     tokio::spawn(async move {
                         let started = std::time::Instant::now();
                         // Identical retries share request_ids — the same
                         // dedup contract single appends rely on.
                         let mut outcome = writer.append_batch(&batch).await;
                         for _ in 0..4 {
-                            if outcome.is_ok() {
+                            // Only uncertain/transient outcomes earn the
+                            // identical-request_id retry; authoritative
+                            // refusals (stale epoch, too large, protocol)
+                            // surface to every waiter immediately.
+                            if !matches!(
+                                outcome,
+                                Err(SdkError::Transport(_)
+                                    | SdkError::Unavailable(_)
+                                    | SdkError::Ambiguous(_))
+                            ) {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -285,6 +407,18 @@ fn spawn_pump(writer: Writer, mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>, 
                         }
                         let rtt = started.elapsed();
                         in_flight.fetch_sub(1, Ordering::Relaxed);
+                        {
+                            let mut flying = in_flight_keys.lock().expect("in-flight keys");
+                            for key in batch_keys {
+                                if let Some(count) = flying.get_mut(&key) {
+                                    *count -= 1;
+                                    if *count == 0 {
+                                        flying.remove(&key);
+                                    }
+                                }
+                            }
+                        }
+                        completed.notify_one();
                         match outcome {
                             Ok(outcomes) => {
                                 let first = outcomes.first();
@@ -317,6 +451,7 @@ fn spawn_pump(writer: Writer, mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>, 
                             None => closed = true,
                         },
                         _ = tokio::time::sleep(wait) => {},
+                        _ = completed.notified() => {},
                     }
                 }
             }
@@ -340,6 +475,7 @@ fn clone_error(error: &SdkError) -> SdkError {
         SdkError::Conflict(detail) => SdkError::Conflict(detail.clone()),
         SdkError::Ambiguous(detail) => SdkError::Ambiguous(detail.clone()),
         SdkError::Unavailable(detail) => SdkError::Unavailable(detail.clone()),
+        SdkError::PayloadTooLarge(detail) => SdkError::PayloadTooLarge(detail.clone()),
         SdkError::Refused(detail) => SdkError::Refused(detail.clone()),
         SdkError::Transport(detail) => SdkError::Transport(detail.clone()),
         SdkError::Protocol(detail) => SdkError::Protocol(detail.clone()),

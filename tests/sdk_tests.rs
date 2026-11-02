@@ -109,6 +109,7 @@ async fn error_mapping_follows_status_and_code_not_text() {
         (409, Some("lease.stale_lease"), SdkError::LeaseStale),
         (409, Some("lease.capacity"), SdkError::LeaseCapacity),
         (409, None, SdkError::Conflict("x".to_owned())),
+        (413, None, SdkError::PayloadTooLarge("x".to_owned())),
         (503, None, SdkError::Unavailable("x".to_owned())),
         (502, None, SdkError::Ambiguous("x".to_owned())),
         (400, None, SdkError::Refused("400: x".to_owned())),
@@ -1139,4 +1140,680 @@ async fn demand_endpoints_cover_every_resource_kind() {
     assert_eq!(requests[1].1, "/v1/admin/demand/subscriptions");
     assert_eq!(requests[2].1, "/v1/admin/demand/indexes");
     assert_eq!(requests[3].1, "/v1/admin/demand/pipes");
+}
+
+/// Append-batch transport that refuses bodies over `limit` records with
+/// 413 and echoes each record's `request_id` back as the outcome cursor
+/// so split order is observable.
+struct LimitTransport {
+    limit: usize,
+    calls: Mutex<Vec<Vec<String>>>,
+    binary_calls: Mutex<Vec<Vec<u8>>>,
+}
+
+impl LimitTransport {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            calls: Mutex::new(Vec::new()),
+            binary_calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Transport for LimitTransport {
+    async fn request(
+        &self,
+        _base: &str,
+        _method: &str,
+        path: &str,
+        body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        if path != "/v1/writers/append-batch" {
+            return Ok(TransportReply {
+                status: 200,
+                body: json!({"results": [{"data": {"session_epoch": 7}}]}),
+            });
+        }
+        let records = body
+            .and_then(|body| body.get("records"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.calls.lock().unwrap().push(
+            records
+                .iter()
+                .filter_map(|record| {
+                    record
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect(),
+        );
+        if records.len() > self.limit {
+            return Ok(TransportReply {
+                status: 413,
+                body: json!({"error": "body too large"}),
+            });
+        }
+        let results: Vec<Value> = records
+            .iter()
+            .map(|record| {
+                json!({
+                    "message_id": Uuid::nil().to_string(),
+                    "cursor": record["request_id"].as_str().unwrap_or_default(),
+                    "deduplicated": false,
+                })
+            })
+            .collect();
+        Ok(TransportReply {
+            status: 200,
+            body: json!({ "results": results }),
+        })
+    }
+
+    async fn request_binary_body(
+        &self,
+        _base: &str,
+        path: &str,
+        body: &[u8],
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        assert_eq!(path, "/v1/writers/append-batch");
+        self.binary_calls.lock().unwrap().push(body.to_vec());
+        let count = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+        let results: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({
+                    "message_id": Uuid::nil().to_string(),
+                    "cursor": format!("c{index}"),
+                    "deduplicated": false,
+                })
+            })
+            .collect();
+        Ok(TransportReply {
+            status: 200,
+            body: json!({ "results": results }),
+        })
+    }
+}
+
+fn limit_client(limit: usize) -> (Client, Arc<LimitTransport>) {
+    let transport = Arc::new(LimitTransport::new(limit));
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .expect("test client");
+    (client, transport)
+}
+
+fn append_item(request_id: Uuid, metadata: BTreeMap<String, Vec<u8>>) -> AppendItem {
+    AppendItem {
+        request_id,
+        key: b"k".to_vec(),
+        payload: b"v".to_vec(),
+        event_time_ns: 1_700_000_000_000_000_001,
+        metadata,
+    }
+}
+
+#[tokio::test]
+async fn append_batch_splits_on_payload_too_large_and_preserves_order() {
+    let (client, transport) = limit_client(2);
+    let writer = open_writer(&client, "orders.wr").await;
+    let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+    let records: Vec<(Uuid, Vec<u8>, Vec<u8>, i64)> = ids
+        .iter()
+        .map(|id| (*id, b"k".to_vec(), b"v".to_vec(), 1))
+        .collect();
+    let outcomes = writer.append_batch(&records).await.unwrap();
+    assert_eq!(outcomes.len(), 4);
+    let cursors: Vec<String> = outcomes
+        .iter()
+        .map(|outcome| outcome.cursor.clone())
+        .collect();
+    assert_eq!(cursors, ids.iter().map(Uuid::to_string).collect::<Vec<_>>());
+    // One refused 4-record call, then two 2-record halves in order.
+    let calls = transport.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].len(), 4);
+    assert_eq!(
+        calls[1],
+        ids[..2].iter().map(Uuid::to_string).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        calls[2],
+        ids[2..].iter().map(Uuid::to_string).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn append_batch_single_record_surfaces_payload_too_large() {
+    let (client, transport) = limit_client(0);
+    let writer = open_writer(&client, "orders.wr").await;
+    let error = writer
+        .append_batch(&[(Uuid::new_v4(), b"k".to_vec(), b"v".to_vec(), 1)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::PayloadTooLarge(_)));
+    assert_eq!(transport.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn append_items_json_carries_metadata_and_compression_flag() {
+    let (client, transport) = client(vec![
+        (200, json!({"results": [{"data": {"session_epoch": 7}}]})),
+        (
+            200,
+            json!({"results": [{
+                "message_id": Uuid::nil().to_string(),
+                "cursor": "c",
+                "deduplicated": false,
+            }]}),
+        ),
+    ]);
+    let client = client.use_compression(true);
+    let writer = open_writer(&client, "orders.wr").await;
+    writer
+        .append_items(&[append_item(
+            Uuid::new_v4(),
+            BTreeMap::from([("source".to_owned(), b"conformance".to_vec())]),
+        )])
+        .await
+        .unwrap();
+    let requests = transport.take_requests();
+    let (_, _, body) = &requests[1];
+    let record = &body["records"][0];
+    assert_eq!(record["use_compression"], true);
+    assert_eq!(
+        record["metadata_base64"]["source"],
+        B64.encode(b"conformance")
+    );
+}
+
+#[tokio::test]
+async fn append_items_binary_frames_carry_metadata_and_compression_flag() {
+    let (client, transport) = limit_client(100);
+    let client = client.use_compression(true);
+    let writer = open_writer(&client, "orders.wr").await.binary_appends();
+    writer
+        .append_items(&[append_item(
+            Uuid::new_v4(),
+            BTreeMap::from([("source".to_owned(), b"conformance".to_vec())]),
+        )])
+        .await
+        .unwrap();
+    let calls = transport.binary_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let page = &calls[0];
+    assert_eq!(u32::from_be_bytes(page[..4].try_into().unwrap()), 1);
+    // Frame: u32be body_len | body | u32be crc.
+    let body_len = u32::from_be_bytes(page[4..8].try_into().unwrap()) as usize;
+    let body = &page[8..8 + body_len];
+    assert_eq!(&body[..4], b"FSA1");
+    let writer_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+    let mut cursor = 6 + writer_len + 16 + 8;
+    let flags = body[cursor];
+    assert_eq!(flags & 0x02, 0x02, "compression flag bit must be set");
+    assert_eq!(flags & 0x01, 0x01, "event_time flag must be set");
+    cursor += 1 + 8; // flags + event_time_ns
+    let key_len = u32::from_be_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4 + key_len;
+    let payload_len = u32::from_be_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4 + payload_len;
+    let metadata_count = u16::from_be_bytes(body[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    assert_eq!(metadata_count, 1);
+    let name_len = u16::from_be_bytes(body[cursor..cursor + 2].try_into().unwrap()) as usize;
+    let value_len = u32::from_be_bytes(body[cursor + 2..cursor + 6].try_into().unwrap()) as usize;
+    cursor += 6;
+    assert_eq!(&body[cursor..cursor + name_len], b"source");
+    cursor += name_len;
+    assert_eq!(&body[cursor..cursor + value_len], b"conformance");
+}
+
+/// Pump-policy transport: append-batch replies are scripted by
+/// `responder`, every other path opens the session.
+struct PumpTransport {
+    calls: Mutex<usize>,
+    responder: fn() -> Result<TransportReply, SdkError>,
+}
+
+#[async_trait]
+impl Transport for PumpTransport {
+    async fn request(
+        &self,
+        _base: &str,
+        _method: &str,
+        path: &str,
+        _body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        if path == "/v1/writers/append-batch" {
+            *self.calls.lock().unwrap() += 1;
+            return (self.responder)();
+        }
+        Ok(TransportReply {
+            status: 200,
+            body: json!({"results": [{"data": {"session_epoch": 7}}]}),
+        })
+    }
+}
+
+fn batching() -> Batching {
+    Batching {
+        linger: std::time::Duration::from_millis(1),
+        max_batch: 4,
+        max_in_flight: 1,
+    }
+}
+
+#[tokio::test]
+async fn pump_returns_authoritative_errors_without_retry() {
+    let transport = Arc::new(PumpTransport {
+        calls: Mutex::new(0),
+        responder: || {
+            Ok(TransportReply {
+                status: 409,
+                body: json!({"error": "superseded", "code": "stale_epoch"}),
+            })
+        },
+    });
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .unwrap();
+    let writer = open_writer(&client, "orders.wr").await;
+    let pumped = writer.batched(batching());
+    let error = pumped
+        .append(Uuid::new_v4(), b"k", b"v", 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error, SdkError::StaleEpoch);
+    assert_eq!(*transport.calls.lock().unwrap(), 1);
+    pumped.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn pump_retries_transport_errors() {
+    let transport = Arc::new(PumpTransport {
+        calls: Mutex::new(0),
+        responder: || Err(SdkError::Transport("connection reset".to_owned())),
+    });
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .unwrap();
+    let writer = open_writer(&client, "orders.wr").await;
+    let pumped = writer.batched(batching());
+    let error = pumped
+        .append(Uuid::new_v4(), b"k", b"v", 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SdkError::Transport(_)));
+    // 5 append attempts, each re-pinned to the same single endpoint, so
+    // one transport call per attempt... plus the failover probe per
+    // attempt — the retry loop, not the error, drives repetition.
+    assert!(*transport.calls.lock().unwrap() >= 5);
+    pumped.flush().await.unwrap();
+}
+
+/// Binary-reply transport: FIFO raw pages for `request_binary` so the
+/// defaulted `request_frame_page` path is exercised end to end.
+type ScriptedPageReply = Result<(u16, Vec<u8>), SdkError>;
+
+struct PageStubTransport {
+    replies: Mutex<std::collections::VecDeque<ScriptedPageReply>>,
+}
+
+#[async_trait]
+impl Transport for PageStubTransport {
+    async fn request(
+        &self,
+        _base: &str,
+        _method: &str,
+        _path: &str,
+        _body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        Ok(TransportReply {
+            status: 500,
+            body: Value::Null,
+        })
+    }
+
+    async fn request_binary(
+        &self,
+        _base: &str,
+        _path: &str,
+        _body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportBytesReply, SdkError> {
+        self.replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(SdkError::Transport("no scripted page".to_owned())))
+            .map(|(status, body)| TransportBytesReply { status, body })
+    }
+}
+
+/// Minimal page encoder matching `application/vnd.whitewater.frames`:
+/// FSR2 record bodies inside the `u32 len | body | crc32` envelope.
+fn stub_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"FSR2");
+    body.extend_from_slice(&[0u8; 16]);
+    body.extend_from_slice(&[0u8; 16]);
+    body.extend_from_slice(&sequence.to_be_bytes());
+    body.extend_from_slice(&1i64.to_be_bytes());
+    body.extend_from_slice(&2i64.to_be_bytes());
+    body.extend_from_slice(&1u32.to_be_bytes());
+    body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(b"k");
+    body.extend_from_slice(payload);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&body);
+    frame.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+    frame
+}
+
+fn stub_page(records: &[(u64, &[u8], &str)], next_cursor: &str) -> Vec<u8> {
+    let mut page = Vec::new();
+    page.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    page.extend_from_slice(&(next_cursor.len() as u32).to_le_bytes());
+    page.extend_from_slice(next_cursor.as_bytes());
+    for (sequence, payload, cursor) in records {
+        page.extend_from_slice(&(cursor.len() as u32).to_le_bytes());
+        page.extend_from_slice(cursor.as_bytes());
+        let frame = stub_frame(*sequence, payload);
+        page.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        page.extend_from_slice(&frame);
+    }
+    page
+}
+
+#[tokio::test]
+async fn pipelined_fetch_returns_pages_in_order_and_stops_on_error() {
+    let pages = vec![
+        Ok((200u16, stub_page(&[(1, b"a", "c1")], "n1"))),
+        Ok((200u16, stub_page(&[(2, b"b", "c2")], "n2"))),
+        Ok((200u16, stub_page(&[(3, b"c", "c3")], ""))),
+    ];
+    let transport = Arc::new(PageStubTransport {
+        replies: Mutex::new(pages.into()),
+    });
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .unwrap();
+    let mut stream = client.temporary_fetch_frames_pipelined(
+        "orders.events",
+        TemporaryFetch {
+            after: None,
+            limit: 10,
+            new_only: false,
+            tail: false,
+            wait_ms: None,
+            after_event_time_ns: None,
+        },
+        1,
+    );
+    let page1 = stream.next().await.unwrap().unwrap();
+    assert_eq!(page1.records.len(), 1);
+    assert_eq!(page1.next_cursor.as_deref(), Some("n1"));
+    let page2 = stream.next().await.unwrap().unwrap();
+    assert_eq!(page2.next_cursor.as_deref(), Some("n2"));
+    let page3 = stream.next().await.unwrap().unwrap();
+    assert_eq!(page3.records.len(), 1);
+    assert_eq!(page3.next_cursor, None);
+    assert!(stream.next().await.is_none());
+
+    // An error on a later page surfaces and ends the stream.
+    let transport = Arc::new(PageStubTransport {
+        replies: Mutex::new(
+            vec![
+                Ok((200u16, stub_page(&[(1, b"a", "c1")], "n1"))),
+                Err(SdkError::Transport("dropped".to_owned())),
+            ]
+            .into(),
+        ),
+    });
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .unwrap();
+    let mut stream = client.temporary_fetch_frames_pipelined(
+        "orders.events",
+        TemporaryFetch {
+            after: None,
+            limit: 10,
+            new_only: false,
+            tail: false,
+            wait_ms: None,
+            after_event_time_ns: None,
+        },
+        1,
+    );
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(matches!(
+        stream.next().await.unwrap(),
+        Err(SdkError::Transport(_))
+    ));
+    assert!(stream.next().await.is_none());
+}
+
+/// Pump-pipeline transport: 20 ms per append-batch, records every call's
+/// start instant and per-request keys so tests can assert concurrency
+/// and per-Key ordering.
+struct PipelineTransport {
+    calls: Mutex<Vec<(std::time::Instant, Vec<Vec<u8>>)>>,
+}
+
+#[async_trait]
+impl Transport for PipelineTransport {
+    async fn request(
+        &self,
+        _base: &str,
+        _method: &str,
+        path: &str,
+        body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        if path != "/v1/writers/append-batch" {
+            return Ok(TransportReply {
+                status: 200,
+                body: json!({"results": [{"data": {"session_epoch": 7}}]}),
+            });
+        }
+        let started = std::time::Instant::now();
+        let records = body
+            .and_then(|body| body.get("records"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let keys: Vec<Vec<u8>> = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .get("key_base64")
+                    .and_then(Value::as_str)
+                    .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+                    .map(|_| Vec::new())
+                    .or_else(|| {
+                        record.get("key_base64").and_then(Value::as_str).map(|v| {
+                            base64::engine::general_purpose::STANDARD
+                                .decode(v)
+                                .unwrap_or_default()
+                        })
+                    })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.calls.lock().unwrap().push((started, keys));
+        let results: Vec<Value> = records
+            .iter()
+            .map(|record| {
+                json!({
+                    "message_id": Uuid::nil().to_string(),
+                    "cursor": record["request_id"].as_str().unwrap_or_default(),
+                    "deduplicated": false,
+                })
+            })
+            .collect();
+        Ok(TransportReply {
+            status: 200,
+            body: json!({ "results": results }),
+        })
+    }
+}
+
+fn pipeline_client(calls: usize) -> (Client, Arc<PipelineTransport>) {
+    let _ = calls;
+    let transport = Arc::new(PipelineTransport {
+        calls: Mutex::new(Vec::new()),
+    });
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .unwrap();
+    (client, transport)
+}
+
+#[tokio::test]
+async fn pump_pipelines_distinct_keys_but_never_one_key() {
+    let (client, transport) = pipeline_client(0);
+    let writer = open_writer(&client, "orders.wp").await;
+    let pumped = writer.batched(Batching {
+        linger: std::time::Duration::from_millis(1),
+        max_batch: 1,
+        max_in_flight: 4,
+    });
+    // Six records on three keys, interleaved: K1 lands twice, K2 twice,
+    // K3 twice — with max_batch 1 each op is its own batch.
+    let mut pending = Vec::new();
+    for index in 0..6_u8 {
+        let key = format!("key-{}", index % 3).into_bytes();
+        pending.push(tokio::spawn({
+            let pumped = pumped.clone();
+            async move {
+                pumped
+                    .append(Uuid::new_v4(), &key, b"v", index as i64)
+                    .await
+            }
+        }));
+    }
+    for task in pending {
+        task.await.unwrap().unwrap();
+    }
+    pumped.flush().await.unwrap();
+    let calls = transport.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 6);
+    // Pipelined: later batches started before earlier ones finished
+    // (each request takes ~20 ms; sequential starts would be ~20 ms
+    // apart).
+    let first_start = calls[0].0;
+    let starts: Vec<std::time::Duration> = calls
+        .iter()
+        .map(|(instant, _)| instant.duration_since(first_start))
+        .collect();
+    assert!(
+        *starts.last().unwrap() < std::time::Duration::from_millis(120),
+        "pipelined rounds should overlap, not serialize: {starts:?}"
+    );
+    // Per-Key order preserved: calls for key-1 strictly precede in
+    // submission order.
+    let key1_starts: Vec<_> = calls
+        .iter()
+        .filter(|(_, keys)| keys.iter().any(|key| key == b"key-1"))
+        .map(|(instant, _)| *instant)
+        .collect();
+    assert!(key1_starts.windows(2).all(|pair| pair[0] < pair[1]));
+    // Every batch carried exactly one key (max_batch 1).
+    assert!(calls.iter().all(|(_, keys)| keys.len() == 1));
+}
+
+#[tokio::test]
+async fn pump_completion_wakes_blocked_rounds_promptly() {
+    let (client, transport) = pipeline_client(0);
+    let writer = open_writer(&client, "orders.wp").await;
+    let pumped = writer.batched(Batching {
+        linger: std::time::Duration::from_millis(1),
+        max_batch: 1,
+        max_in_flight: 1,
+    });
+    // One key twice, then an unrelated key: the second same-Key op must
+    // wait for round 1 to finish but round 3 rides immediately after.
+    let first = tokio::spawn({
+        let pumped = pumped.clone();
+        async move { pumped.append(Uuid::new_v4(), b"a", b"1", 1).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let second = tokio::spawn({
+        let pumped = pumped.clone();
+        async move { pumped.append(Uuid::new_v4(), b"a", b"2", 2).await }
+    });
+    let third = tokio::spawn({
+        let pumped = pumped.clone();
+        async move { pumped.append(Uuid::new_v4(), b"b", b"3", 3).await }
+    });
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    third.await.unwrap().unwrap();
+    pumped.flush().await.unwrap();
+    let calls = transport.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3);
+    // Key-blocked round 2 starts promptly after round 1 — a completion
+    // notification, not a 500 ms poll, wakes the pump.
+    let gap = calls[1].0.duration_since(calls[0].0);
+    assert!(
+        gap < std::time::Duration::from_millis(100),
+        "completion must wake the pump promptly, not at 500 ms: {gap:?}"
+    );
+}
+
+#[tokio::test]
+async fn pump_groups_same_key_ops_into_one_batch_in_order() {
+    let (client, transport) = pipeline_client(0);
+    let writer = open_writer(&client, "orders.wg").await;
+    let pumped = writer.batched(Batching {
+        linger: std::time::Duration::from_millis(30),
+        max_batch: 512,
+        max_in_flight: 4,
+    });
+    let mut pending = Vec::new();
+    for index in 0..20_u8 {
+        pending.push(tokio::spawn({
+            let pumped = pumped.clone();
+            async move {
+                pumped
+                    .append(Uuid::new_v4(), b"same", b"v", index as i64)
+                    .await
+            }
+        }));
+    }
+    for task in pending {
+        task.await.unwrap().unwrap();
+    }
+    pumped.flush().await.unwrap();
+    let calls = transport.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "20 same-Key ops must form one batch");
+    assert_eq!(calls[0].1.len(), 20);
 }

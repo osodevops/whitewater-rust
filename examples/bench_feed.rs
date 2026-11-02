@@ -15,6 +15,9 @@
 //! `BENCH_FEEDS` (parallel pipelines = Kafka partition count),
 //! `BENCH_PAGE_LIMIT`, `BENCH_READ_FORMAT` (`binary`|`json`),
 //! `BENCH_MODE` (`all`|`write`|`read`), `BENCH_AUTOTUNE`
+//! `BENCH_BATCHED` (producer-style batched writers: `BENCH_LINGER_MS`
+//! default 5, `BENCH_BATCH` cap, `BENCH_IN_FLIGHT` default 5),
+//! `BENCH_READ_PREFETCH` (pipelined fetch depth, default 1)
 //! (self-adjusting batch pump instead of caller-sized batches).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +26,7 @@ use std::time::Instant;
 
 use serde_json::json;
 use uuid::Uuid;
-use whitewater::{Client, TemporaryFetch};
+use whitewater::{Client, TemporaryFetch, TemporaryPage};
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -53,6 +56,7 @@ struct WriteStats {
 
 struct WriteWork {
     autotuned: Option<whitewater::AutoTune>,
+    batched: Option<whitewater::Batching>,
     binary_appends: bool,
     share: u64,
     batch: u64,
@@ -68,6 +72,7 @@ async fn write_worker(
 ) {
     let WriteWork {
         autotuned,
+        batched,
         binary_appends,
         share,
         batch,
@@ -88,9 +93,10 @@ async fn write_worker(
         writer
     };
     let autotuned = autotuned.map(|tune| writer.autotuned(tune));
+    let batched = batched.map(|batching| writer.batched(batching));
     let mut sent = 0u64;
     let mut index = base_index;
-    if let Some(pumped) = autotuned {
+    if let Some(pumped) = autotuned.or(batched) {
         // Producer-style: queue records without awaiting each — the
         // pump coalesces the queue into append-batch rounds; each
         // record's returned future resolves when its batch commits.
@@ -101,11 +107,18 @@ async fn write_worker(
                 let record = payload.clone();
                 let time = 1_700_000_000_000_000_000i64 + index as i64;
                 let pumped = pumped.clone();
+                let base = writer.pinned_base();
+                let name = writer_name.clone();
                 pending.spawn(async move {
-                    (
-                        Instant::now(),
-                        pumped.append(Uuid::new_v4(), &key, &record, time).await,
-                    )
+                    let mark = Instant::now();
+                    let outcome = pumped.append(Uuid::new_v4(), &key, &record, time).await;
+                    if mark.elapsed().as_secs() > 5 {
+                        eprintln!(
+                            "SLOW append: {:.0} ms writer={name} base={base}",
+                            mark.elapsed().as_secs_f64() * 1_000.0
+                        );
+                    }
+                    (mark, outcome)
                 });
                 index += 1;
                 sent += 1;
@@ -191,6 +204,7 @@ async fn read_worker(
     let mut bytes = 0u64;
     let mut stalled = 0u32;
     let started = Instant::now();
+    let mut page_ms: Vec<f64> = Vec::new();
     while records < expected {
         let options = TemporaryFetch {
             after: after.clone(),
@@ -200,12 +214,31 @@ async fn read_worker(
             wait_ms: Some(5_000),
             after_event_time_ns: None,
         };
+        let page_mark = Instant::now();
         let page = if binary {
-            client.temporary_fetch_frames(&feed, options).await
+            let prefetch = env_u64("BENCH_READ_PREFETCH", 1);
+            if prefetch > 0 {
+                let mut stream = client.temporary_fetch_frames_pipelined(
+                    &feed,
+                    options,
+                    prefetch.max(1) as usize,
+                );
+                match stream.next().await {
+                    Some(Ok(page)) => Ok(page),
+                    Some(Err(error)) => Err(error),
+                    None => Ok(TemporaryPage {
+                        records: Vec::new(),
+                        next_cursor: None,
+                    }),
+                }
+            } else {
+                client.temporary_fetch_frames(&feed, options).await
+            }
         } else {
             client.temporary_fetch(&feed, options).await
         }
         .map_err(|error| format!("{feed} fetch failed: {error}"))?;
+        page_ms.push(page_mark.elapsed().as_secs_f64() * 1_000.0);
         if page.records.is_empty() {
             stalled += 1;
             if stalled > 24 {
@@ -228,6 +261,15 @@ async fn read_worker(
             None => break,
         }
     }
+    page_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = page_ms.iter().sum::<f64>() / page_ms.len().max(1) as f64;
+    let p50 = page_ms.get(page_ms.len() / 2).copied().unwrap_or(0.0);
+    eprintln!(
+        "READ_TIMING {{\"pages\":{},\"mean_page_ms\":{:.2},\"p50_page_ms\":{:.2}}}",
+        page_ms.len(),
+        mean,
+        p50
+    );
     Ok((records, bytes, started.elapsed().as_secs_f64()))
 }
 
@@ -254,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let writers = env_u64("BENCH_WRITERS", 4) as usize;
     let batch = env_u64("BENCH_BATCH", 50);
     let autotune = env_u64("BENCH_AUTOTUNE", 0) != 0;
+    let batched_mode = env_u64("BENCH_BATCHED", 0) != 0;
     let binary_writes = env_str("BENCH_WRITE_FORMAT", "json") == "binary";
     let tune = whitewater::AutoTune {
         max_batch: env_u64("BENCH_MAX_BATCH", 512) as usize,
@@ -340,6 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writer_names[index].clone(),
                 WriteWork {
                     autotuned: autotune.then_some(tune),
+                    batched: batched_mode.then_some(whitewater::Batching {
+                        linger: std::time::Duration::from_millis(env_u64("BENCH_LINGER_MS", 5)),
+                        max_batch: env_u64("BENCH_BATCH", 512) as usize,
+                        max_in_flight: env_u64("BENCH_IN_FLIGHT", 5) as usize,
+                    }),
                     binary_appends: binary_writes,
                     share: shares[index],
                     batch,
