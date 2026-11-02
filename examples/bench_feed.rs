@@ -13,6 +13,8 @@
 //! `http://localhost:7771..7773`), `WHITEWATER_ADMIN_API_KEY`,
 //! `BENCH_RECORDS`, `BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`,
 //! `BENCH_FEEDS` (parallel pipelines = Kafka partition count),
+//! `BENCH_RANGES` (pre-split each Feed into N Active Ranges at even
+//! KeyToken boundaries; skipped with BENCH_PROVISIONED=1),
 //! `BENCH_PAGE_LIMIT`, `BENCH_READ_FORMAT` (`binary`|`json`),
 //! `BENCH_MODE` (`all`|`write`|`read`), `BENCH_AUTOTUNE`
 //! `BENCH_BATCHED` (producer-style batched writers: `BENCH_LINGER_MS`
@@ -62,6 +64,49 @@ struct WriteWork {
     batch: u64,
     payload: Vec<u8>,
     base_index: u64,
+}
+
+/// Pre-provision `ranges` Active Ranges at even KeyToken boundaries —
+/// the internal equivalent of creating a Feed with N pipelines before
+/// load starts (mirrors `whitewater/scripts/bench-feed.py` pre_split).
+async fn pre_split(client: &Client, feed_names: &[String], ranges: u64) -> Result<(), String> {
+    for feed in feed_names {
+        for index in 1..ranges {
+            // Boundary i/N of the 128-bit token space as a 32-char hex —
+            // index * 2^128 / N expanded as (MAX+1) terms so each part
+            // fits a u128 (index < N keeps every product in range).
+            let token = format!(
+                "{:032x}",
+                index as u128 * (u128::MAX / ranges as u128)
+                    + index as u128 * (u128::MAX % ranges as u128 + 1) / ranges as u128
+            );
+            let reply = client
+                .wire(
+                    "POST",
+                    "/v1/admin/ranges/split",
+                    Some(&json!({
+                        "request_id": Uuid::new_v4().to_string(),
+                        "feed": feed,
+                        "split_at": token,
+                    })),
+                )
+                .await
+                .map_err(|error| format!("pre-split {index}/{ranges} failed: {error}"))?;
+            if reply.status != 200 {
+                return Err(format!(
+                    "pre-split {index}/{ranges} refused: {}",
+                    reply.body
+                ));
+            }
+            if reply.body.get("status").and_then(|s| s.as_str()) != Some("activated") {
+                return Err(format!(
+                    "pre-split {index}/{ranges} not activated: {}",
+                    reply.body
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn write_worker(
@@ -355,6 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
         client.wcl(&script).await?;
+        pre_split(&client, &feed_names, env_u64("BENCH_RANGES", 1)).await?;
     }
 
     // writer -> feed assignment determines per-feed expected read counts.
