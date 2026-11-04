@@ -200,7 +200,11 @@ impl AutoTuner {
             // shed is concurrency — halving outstanding rounds — not
             // smaller batches, which would send MORE requests and
             // amplify the per-round fixed cost driving that pressure.
-            self.in_flight_limit = (self.in_flight_limit / 2).max(1);
+            // Floor at 2: sustained pressure must never collapse a
+            // busy queue to strictly serial rounds — one outstanding
+            // round plus the stalled queue reproduces the 1-in-flight
+            // profile this shed exists to relieve.
+            self.in_flight_limit = (self.in_flight_limit / 2).max(2);
         } else if rtt <= self.config.latency_budget {
             // No pressure evidence and fast rounds: recover one
             // outstanding slot toward the configured ceiling.
@@ -308,11 +312,13 @@ mod tests {
         tuner.observe(512, Duration::from_millis(300), Some(16), None);
         assert_eq!(tuner.in_flight_limit(), 2);
         tuner.observe(512, Duration::from_millis(300), Some(8), None);
-        assert_eq!(tuner.in_flight_limit(), 1);
+        // The shed floors at 2 — sustained pressure must never
+        // serialize a busy queue to one outstanding round.
+        assert_eq!(tuner.in_flight_limit(), 2);
         // ...but never below one, and recovery returns as pressure
         // clears and rounds stay inside the budget.
         tuner.observe(512, Duration::from_millis(30), Some(100), None);
-        assert_eq!(tuner.in_flight_limit(), 2);
+        assert_eq!(tuner.in_flight_limit(), 3);
     }
 
     #[test]

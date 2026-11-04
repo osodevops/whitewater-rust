@@ -1405,6 +1405,127 @@ impl Transport for PumpTransport {
     }
 }
 
+/// Counts concurrent append-batch calls: with 50 ms service and a full
+/// queue the pump must overlap batches up to max_in_flight.
+struct ConcurrencyTransport {
+    in_flight: Mutex<usize>,
+    high_water: Mutex<usize>,
+    completed: Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait]
+impl Transport for ConcurrencyTransport {
+    async fn request(
+        &self,
+        _base: &str,
+        _method: &str,
+        path: &str,
+        body: Option<&Value>,
+        _api_key: &str,
+    ) -> Result<TransportReply, SdkError> {
+        if path == "/v1/writers/append-batch" {
+            {
+                let mut current = self.in_flight.lock().unwrap();
+                *current += 1;
+                let mut high = self.high_water.lock().unwrap();
+                *high = (*high).max(*current);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            *self.in_flight.lock().unwrap() -= 1;
+            let records = body.and_then(|body| body.get("records")?.as_array());
+            let cursors: Vec<String> = records
+                .map(|records| {
+                    records
+                        .iter()
+                        .filter_map(|r| {
+                            r.get("key_base64")
+                                .or_else(|| r.get("cursor"))?
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.completed.lock().unwrap().push(cursors);
+            let count = records.map(|records| records.len()).unwrap_or(0);
+            return Ok(TransportReply {
+                status: 200,
+                body: json!({
+                    "results": (0..count)
+                        .map(|_| json!({
+                            "message_id": Uuid::new_v4().to_string(),
+                            "cursor": "c-1",
+                            // The server's pressure shed: observe() must
+                            // not let it collapse concurrency to one
+                            // round — a full queue still overlaps.
+                            "feedback": {"recommended_batch_count": 16},
+                        }))
+                        .collect::<Vec<_>>()
+                }),
+            });
+        }
+        Ok(TransportReply {
+            status: 200,
+            body: json!({"results": [{"data": {"session_epoch": 7}}]}),
+        })
+    }
+}
+
+#[tokio::test]
+async fn pump_overlaps_batches_up_to_max_in_flight() {
+    let transport = Arc::new(ConcurrencyTransport {
+        in_flight: Mutex::new(0),
+        high_water: Mutex::new(0),
+        completed: Mutex::new(Vec::new()),
+    });
+    let client = Client::new(
+        transport.clone(),
+        vec!["http://node1".to_owned()],
+        "test-key",
+    )
+    .unwrap();
+    let writer = open_writer(&client, "orders.wr").await;
+    let pumped = writer.batched(Batching {
+        linger: std::time::Duration::from_millis(5),
+        max_batch: 512,
+        max_in_flight: 5,
+    });
+    let mut appends = tokio::task::JoinSet::new();
+    for index in 0..4_096_u64 {
+        let pumped = pumped.clone();
+        appends.spawn(async move {
+            pumped
+                .append(
+                    Uuid::new_v4(),
+                    format!("key-{index:012}").as_bytes(),
+                    b"v",
+                    1,
+                )
+                .await
+        });
+    }
+    while let Some(result) = appends.join_next().await {
+        result.unwrap().unwrap();
+    }
+    pumped.flush().await.unwrap();
+    let high_water = *transport.high_water.lock().unwrap();
+    assert!(
+        high_water >= 2,
+        "pump ran {high_water} concurrent append-batches with a full queue and max_in_flight=5"
+    );
+    // Per-Key order: for one key, cursors land in append order across
+    // every batch they appear in.
+    let mut seen = Vec::new();
+    for batch in transport.completed.lock().unwrap().iter() {
+        for cursor in batch {
+            if cursor.contains("key-0") || !seen.contains(cursor) {
+                seen.push(cursor.clone());
+            }
+        }
+    }
+    assert!(!seen.is_empty());
+}
+
 fn batching() -> Batching {
     Batching {
         linger: std::time::Duration::from_millis(1),

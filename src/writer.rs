@@ -230,6 +230,7 @@ pub use crate::autotune::{AutoTune, Batching};
 #[derive(Clone)]
 pub struct PumpedWriter {
     tx: tokio::sync::mpsc::UnboundedSender<Op>,
+
     /// Live tuner state under `autotuned`; absent under `batched`
     /// where the cap is fixed.
     auto: Option<Arc<std::sync::Mutex<crate::autotune::AutoTuner>>>,
