@@ -39,18 +39,11 @@ async fn main() -> Result<(), whitewater::SdkError> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    client
-        .wcl(&format!(
-            "CREATE DOMAIN {domain}; CREATE FEED {domain}.events;"
-        ))
-        .await?;
+    let shop = client.create_domain(&domain).await?;
+    shop.create_feed("events").await?;
 
     // Bind codecs once — every read and write serializes automatically.
-    let feed = client.feed_with(
-        &format!("{domain}.events"),
-        Codec::utf8(),
-        Codec::<Order>::json(),
-    );
+    let feed = shop.feed_with("events", Codec::utf8(), Codec::<Order>::json())?;
 
     let writer = feed.writer("checkout").await?;
     writer

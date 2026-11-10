@@ -11,11 +11,12 @@
 //!     vec!["https://node1:7371".to_owned()],
 //!     "api-key",
 //! )?;
-//! let orders = client.feed_with(
-//!     "orders.events",
+//! let orders_domain = client.domain("orders")?;
+//! let orders = orders_domain.feed_with(
+//!     "events",
 //!     Codec::utf8(),
 //!     Codec::<serde_json::Value>::json(),
-//! );
+//! )?;
 //! let writer = orders.writer("checkout").await?;
 //! writer.append(&"order-1".to_owned(), &serde_json::json!({"total": 42})).await?;
 //! # Ok(())
@@ -369,14 +370,17 @@ impl<K, V> Feed<K, V> {
 
     /// Session-bound named Writer on this Feed: declares `CREATE WRITER
     /// <name> TO <feed>` when missing, then opens the session epoch.
+    /// `writer_name` resolves inside the Feed's Domain — `"ingest"` on
+    /// `shop.orders` declares `shop.ingest`.
     pub async fn writer(&self, writer_name: &str) -> Result<FeedWriter<K, V>, SdkError> {
+        let writer_name = self.scope(writer_name)?;
         self.client
             .create_resource_tolerating_exists(&format!(
                 "CREATE WRITER {writer_name} TO {}",
                 self.name
             ))
             .await?;
-        let session = self.client.writer(writer_name).await?;
+        let session = self.client.writer(&writer_name).await?;
         Ok(FeedWriter {
             session,
             key_codec: self.key_codec.clone(),
@@ -403,13 +407,14 @@ impl<K, V> Feed<K, V> {
         capacity: u64,
         start_wcl: &str,
     ) -> Result<FeedReader<K, V>, SdkError> {
+        let reader_name = self.scope(reader_name)?;
         self.client
             .create_resource_tolerating_exists(&format!(
                 "CREATE READER {reader_name} FROM {} START AT {start_wcl}",
                 self.name
             ))
             .await?;
-        let session = self.client.reader(reader_name, capacity).await?;
+        let session = self.client.reader(&reader_name, capacity).await?;
         Ok(FeedReader {
             session,
             key_codec: self.key_codec.clone(),
@@ -435,6 +440,19 @@ impl<K, V> Feed<K, V> {
         V: Send + 'static,
     {
         crate::consumer::FeedConsumer::new(self.clone(), reader_name)
+    }
+
+    /// Resolve `name` inside this Feed's Domain — the first dotted
+    /// segment owns named Writers/Readers (`shop.orders` →
+    /// `shop.<name>`); an already-qualified name (`shop.ingest`)
+    /// passes through.
+    pub(crate) fn scope(&self, name: &str) -> Result<String, SdkError> {
+        let domain = self.name.split('.').next().unwrap_or("");
+        if name.starts_with(&format!("{domain}.")) {
+            crate::domain::dotted(name)
+        } else {
+            crate::domain::dotted(&format!("{domain}.{name}"))
+        }
     }
 
     /// Read one page straight off the Feed: `after` resumes from an

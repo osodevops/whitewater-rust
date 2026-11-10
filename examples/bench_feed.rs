@@ -111,6 +111,7 @@ async fn pre_split(client: &Client, feed_names: &[String], ranges: u64) -> Resul
 
 async fn write_worker(
     client: Client,
+    domain: String,
     writer_name: String,
     work: WriteWork,
     stats: std::sync::Arc<WriteStats>,
@@ -124,7 +125,12 @@ async fn write_worker(
         payload,
         base_index,
     } = work;
-    let writer = match client.writer(&writer_name).await {
+    let writer = match client
+        .domain(&domain)
+        .expect("domain")
+        .writer(&writer_name)
+        .await
+    {
         Ok(writer) => writer,
         Err(error) => {
             stats.errors.fetch_add(share, Ordering::Relaxed);
@@ -244,6 +250,9 @@ async fn read_worker(
     page_limit: u64,
     binary: bool,
 ) -> Result<(u64, u64, f64), String> {
+    let domain = client
+        .domain(feed.split('.').next().unwrap_or(""))
+        .map_err(|error| format!("domain: {error}"))?;
     let mut after: Option<String> = None;
     let mut records = 0u64;
     let mut bytes = 0u64;
@@ -263,11 +272,9 @@ async fn read_worker(
         let page = if binary {
             let prefetch = env_u64("BENCH_READ_PREFETCH", 1);
             if prefetch > 0 {
-                let mut stream = client.temporary_fetch_frames_pipelined(
-                    &feed,
-                    options,
-                    prefetch.max(1) as usize,
-                );
+                let mut stream = domain
+                    .temporary_fetch_frames_pipelined(&feed, options, prefetch.max(1) as usize)
+                    .map_err(|error| format!("{feed} fetch failed: {error}"))?;
                 match stream.next().await {
                     Some(Ok(page)) => Ok(page),
                     Some(Err(error)) => Err(error),
@@ -277,10 +284,10 @@ async fn read_worker(
                     }),
                 }
             } else {
-                client.temporary_fetch_frames(&feed, options).await
+                domain.temporary_fetch_frames(&feed, options).await
             }
         } else {
-            client.temporary_fetch(&feed, options).await
+            domain.temporary_fetch(&feed, options).await
         }
         .map_err(|error| format!("{feed} fetch failed: {error}"))?;
         page_ms.push(page_mark.elapsed().as_secs_f64() * 1_000.0);
@@ -395,7 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for (index, name) in writer_names.iter().enumerate() {
             script.push_str(&format!(
-                "CREATE WRITER {name} TO {}; ",
+                "CREATE WRITER {domain}.{name} TO {}; ",
                 feed_names[index % feeds]
             ));
         }
@@ -426,6 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for index in 0..writers {
             handles.push(tokio::spawn(write_worker(
                 client.clone(),
+                domain.clone(),
                 writer_names[index].clone(),
                 WriteWork {
                     autotuned: autotune.then_some(tune),

@@ -25,11 +25,12 @@ Every Pipe names a **Subscription** — the durable delivery lease it pulls
 input through. Declare one per Pipe:
 
 ```rust
-client
-    .create_subscription("orders.sub", "ops.orders", None)
+let ops = client.create_domain("ops").await?;
+ops.create_subscription("orders.sub", "orders", None)
     .await?;
 // start defaults to ReaderStart::Beginning; ReaderStart::Now /
-// Cursor / TimestampNs select other starts.
+// Cursor / TimestampNs select other starts. The source Feed may cross
+// Domains — pass its Feed handle or Scoped::abs("other.feed").
 ```
 
 `enrich` and `window` pipes need a **StateStore** (see `docs/stores.md`):
@@ -37,20 +38,19 @@ client
 ```rust
 use whitewater::{Extractor, StateStoreSpec};
 
-let spec = StateStoreSpec::new("ops.customers")?
+let spec = StateStoreSpec::new("customers")?            // -> ops.customers
     .add_key("email", true, Some(Extractor::json("$.email")?))?
     .add_key("tier", false, Some(Extractor::json("$.tier")?))?;
-client.define_state_store(spec, Some("ops.customer.changes")).await?;
+ops.define_state_store(spec, Some("customer.changes".into())).await?;
 ```
 
 ## 2. Forward pipes
 
 ```rust
-client
-    .define_forward_pipe(
-        "ops.orders.relay",   // pipe name (dotted)
-        "orders.sub",         // source subscription
-        "ops.orders.relayed", // output feed
+ops.define_forward_pipe(
+        "orders.relay",       // pipe name -> ops.orders.relay
+        "orders.sub",         // input subscription (same Domain)
+        "orders.relayed",     // output feed — or a Feed handle / Scoped::abs
     )
     .await?;
 ```
@@ -65,8 +65,7 @@ journal — replayed outputs are byte-identical.
 ```rust
 use whitewater::{EnrichFreshness, EnrichMiss, Extractor, PipeOperation};
 
-client
-    .define_enrich_pipe(
+ops.define_enrich_pipe(
         "ops.orders.enrich",
         "orders.sub",
         "ops.enriched",
@@ -91,13 +90,12 @@ enumerable without composite row keys:
 ```rust
 use whitewater::{PipeOperation, WindowAggregation, WindowTime};
 
-let panes = StateStoreSpec::new("ops.order.counts")?
+let panes = StateStoreSpec::new("order.counts")?        // -> ops.order.counts
     .add_key("key", false, None)?
     .add_key("pane", false, None)?;
-client.define_state_store(panes, None).await?;
+ops.define_state_store(panes, None).await?;
 
-client
-    .define_window_pipe(
+ops.define_window_pipe(
         "ops.orders.hourly",
         "orders.sub",
         "ops.order.counts",              // pane store (declared above)
@@ -111,7 +109,7 @@ client
         .grace(Duration::from_secs(60))        // revise emitted panes up to 1m late
         .expire(Duration::from_secs(86_400))   // keep panes 24h
         .key_limit(10_000),
-        Some("ops.hourly.emits"),        // optional closed-pane output
+        Some(Scoped::rel("hourly.emits")), // optional closed-pane output
     )
     .await?;
 ```
@@ -146,14 +144,14 @@ WindowAggregation::average(Extractor::json("$.rtt")?);
 ## 5. Lifecycle
 
 ```rust
-let pipe = client.pipe("ops.orders.relay");
+let pipe = ops.pipe("orders.relay")?;
 
 let info = pipe.describe().await?;   // stage, operation, outputs, status
 pipe.pause().await?;                 // cooperative; the frontier stays put
 pipe.resume().await?;                // restarts from the durable frontier
 pipe.drop().await?;
 
-let all_pipes = client.pipes().await?;
+let all_pipes = ops.pipe_infos().await?;
 ```
 
 `pause` is durable and idempotent — nothing is dropped while paused.

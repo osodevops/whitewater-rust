@@ -73,6 +73,114 @@ impl FeedSchema {
     }
 }
 
+/// A Pipe/Subscription endpoint name — resolved against the declaring
+/// Domain ([`Scoped::Rel`]) or carried as an already-qualified
+/// cross-Domain name ([`Scoped::Abs`]). Bare `&str`/`String` arguments
+/// convert to `Rel`; `Feed`/`Store`/`StateStore`/`SubscriptionRef`
+/// handles convert to `Abs` with their absolute name, so cross-Domain
+/// wiring always passes through a handle or an explicit
+/// [`Scoped::abs`] — never an ambiguously-qualified string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scoped {
+    /// Resolve inside the declaring Domain (`"orders"` → `shop.orders`).
+    Rel(String),
+    /// Already-qualified name kept verbatim (`"warehouse.inbound"`).
+    Abs(String),
+}
+
+impl Scoped {
+    /// An endpoint in the declaring Domain.
+    pub fn rel(name: impl Into<String>) -> Self {
+        Scoped::Rel(name.into())
+    }
+
+    /// A fully-qualified endpoint in another Domain.
+    pub fn abs(name: impl Into<String>) -> Self {
+        Scoped::Abs(name.into())
+    }
+}
+
+impl From<&str> for Scoped {
+    fn from(name: &str) -> Self {
+        Scoped::Rel(name.to_owned())
+    }
+}
+
+impl From<String> for Scoped {
+    fn from(name: String) -> Self {
+        Scoped::Rel(name)
+    }
+}
+
+impl From<&String> for Scoped {
+    fn from(name: &String) -> Self {
+        Scoped::Rel(name.clone())
+    }
+}
+
+impl<K, V> From<&Feed<K, V>> for Scoped {
+    fn from(feed: &Feed<K, V>) -> Self {
+        Scoped::Abs(feed.name().to_owned())
+    }
+}
+
+impl<K, V> From<Feed<K, V>> for Scoped {
+    fn from(feed: Feed<K, V>) -> Self {
+        Scoped::Abs(feed.name().to_owned())
+    }
+}
+
+impl From<&crate::store::StateStore> for Scoped {
+    fn from(store: &crate::store::StateStore) -> Self {
+        Scoped::Abs(store.name.clone())
+    }
+}
+
+impl From<crate::store::StateStore> for Scoped {
+    fn from(store: crate::store::StateStore) -> Self {
+        Scoped::Abs(store.name)
+    }
+}
+
+impl<K, V> From<&crate::typed_store::Store<K, V>> for Scoped {
+    fn from(store: &crate::typed_store::Store<K, V>) -> Self {
+        Scoped::Abs(store.name().to_owned())
+    }
+}
+
+impl<K, V> From<crate::typed_store::Store<K, V>> for Scoped {
+    fn from(store: crate::typed_store::Store<K, V>) -> Self {
+        Scoped::Abs(store.name().to_owned())
+    }
+}
+
+/// A durable Subscription handle — carries its absolute name so it can
+/// join members ([`Domain::member`]) or serve as a cross-Domain Pipe
+/// endpoint without re-qualifying.
+#[derive(Debug, Clone)]
+pub struct SubscriptionRef {
+    name: String,
+}
+
+impl SubscriptionRef {
+    /// The fully-qualified Subscription name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl From<&SubscriptionRef> for Scoped {
+    fn from(sub: &SubscriptionRef) -> Self {
+        Scoped::Abs(sub.name.clone())
+    }
+}
+
+impl From<SubscriptionRef> for Scoped {
+    fn from(sub: SubscriptionRef) -> Self {
+        Scoped::Abs(sub.name)
+    }
+}
+
 /// A strongly-typed handle on one Domain. Construct via
 /// [`Client::domain`] (lazy) or [`Client::get_domain`] (eager — verifies
 /// the Domain exists and loads the snapshot immediately).
@@ -230,7 +338,7 @@ impl Domain {
     /// name (`"shop.orders"`) is accepted; every result lives under the
     /// Domain's prefix by construction. Pure name composition — no I/O.
     pub fn feed(&self, relative: &str) -> Result<Feed<String, String>, SdkError> {
-        self.feed_with(relative, Codec::utf8(), Codec::utf8())
+        Ok(self.client.feed(&self.resolve(relative)?))
     }
 
     /// [`Domain::feed`] with explicit key/value codecs — JSON payloads
@@ -298,6 +406,296 @@ impl Domain {
         self.client.create_writer(self, &feed.into_feed(self)?)
     }
 
+    // ---- Subscriptions ---------------------------------------------------------
+
+    /// A [`SubscriptionRef`] bound to `relative` inside this Domain —
+    /// pure name composition, no I/O.
+    pub fn subscription(&self, relative: &str) -> Result<SubscriptionRef, SdkError> {
+        Ok(SubscriptionRef {
+            name: self.resolve(relative)?,
+        })
+    }
+
+    /// `CREATE SUBSCRIPTION <relative> FROM <feed>` inside this Domain.
+    /// `feed` is a [`Scoped`] endpoint: a bare name resolves in-domain,
+    /// a [`Feed`] handle or [`Scoped::abs`] points the source into
+    /// another Domain.
+    pub async fn create_subscription(
+        &self,
+        relative: &str,
+        feed: impl Into<Scoped>,
+        start: Option<ReaderStart>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let name = self.resolve(relative)?;
+        self.client
+            .create_subscription(&name, &self.scoped_name(feed)?, start)
+            .await
+    }
+
+    /// Join a Subscription as a cooperating member — `subscription` is a
+    /// [`Scoped`] endpoint, so a [`SubscriptionRef`] carries the
+    /// absolute name across Domains.
+    pub async fn member(
+        &self,
+        subscription: impl Into<Scoped>,
+    ) -> Result<crate::member::Member, SdkError> {
+        self.client.member(&self.scoped_name(subscription)?).await
+    }
+
+    // ---- Sessions ---------------------------------------------------------------
+
+    /// Open a session on the named Writer declared inside this Domain —
+    /// `name` resolves to `<domain>.<name>` when relative.
+    pub async fn writer(&self, name: &str) -> Result<crate::writer::Writer, SdkError> {
+        self.client.writer(&self.resolve(name)?).await
+    }
+
+    /// Bind a declared Reader inside this Domain — `open` returns the
+    /// session epoch and current delivered/acknowledged cursors.
+    pub async fn reader(
+        &self,
+        name: &str,
+        capacity: u64,
+    ) -> Result<crate::reader::Reader, SdkError> {
+        self.client.reader(&self.resolve(name)?, capacity).await
+    }
+
+    // ---- Raw reads ----------------------------------------------------------------
+
+    /// Read one page straight off `relative` — the Domain-scoped form
+    /// of the raw Feed read: `after` resumes from an opaque Cursor.
+    pub async fn records(
+        &self,
+        feed: &str,
+        after: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<crate::model::Record>, SdkError> {
+        self.client
+            .records(&self.resolve(feed)?, after, limit)
+            .await
+    }
+
+    /// Temporary read on `relative` — bounded history walks, live
+    /// tails, or fresh-only waits per `options`.
+    pub async fn temporary_fetch(
+        &self,
+        feed: &str,
+        options: crate::model::TemporaryFetch,
+    ) -> Result<crate::model::TemporaryPage, SdkError> {
+        self.client
+            .temporary_fetch(&self.resolve(feed)?, options)
+            .await
+    }
+
+    /// [`Domain::temporary_fetch`] on the binary frame wire.
+    pub async fn temporary_fetch_frames(
+        &self,
+        feed: &str,
+        options: crate::model::TemporaryFetch,
+    ) -> Result<crate::model::TemporaryPage, SdkError> {
+        self.client
+            .temporary_fetch_frames(&self.resolve(feed)?, options)
+            .await
+    }
+
+    /// Pipelined variant of [`Domain::temporary_fetch_frames`].
+    pub fn temporary_fetch_frames_pipelined(
+        &self,
+        feed: &str,
+        options: crate::model::TemporaryFetch,
+        depth: usize,
+    ) -> Result<crate::client::TemporaryFramePageStream, SdkError> {
+        Ok(self
+            .client
+            .temporary_fetch_frames_pipelined(&self.resolve(feed)?, options, depth))
+    }
+
+    // ---- StateStores ---------------------------------------------------------------
+
+    /// Bind the declared node-side StateStore `relative` inside this
+    /// Domain — `accounts.state_store("employees")` binds
+    /// `accounts.employees`.
+    pub fn state_store(&self, relative: &str) -> Result<crate::store::StateStore, SdkError> {
+        Ok(self.client.state_store(&self.resolve(relative)?))
+    }
+
+    /// [`Domain::state_store`] bound to raw byte keys/values.
+    pub fn state_store_raw(&self, relative: &str) -> Result<crate::store::StateStore, SdkError> {
+        Ok(self.client.state_store_raw(&self.resolve(relative)?))
+    }
+
+    /// A codec-bound [`Store`] facade on `relative` — UTF-8 strings.
+    pub fn store(
+        &self,
+        relative: &str,
+    ) -> Result<crate::typed_store::Store<String, String>, SdkError> {
+        Ok(self.client.store(&self.resolve(relative)?))
+    }
+
+    /// [`Domain::store`] with explicit key/value codecs.
+    pub fn store_with<K, V>(
+        &self,
+        relative: &str,
+        key_codec: Codec<K>,
+        value_codec: Codec<V>,
+    ) -> Result<crate::typed_store::Store<K, V>, SdkError> {
+        Ok(self
+            .client
+            .store_with(&self.resolve(relative)?, key_codec, value_codec))
+    }
+
+    /// `DEFINE STATESTORE` inside this Domain — `spec`'s name resolves
+    /// to the Domain prefix; `source` is a [`Scoped`] Feed that the
+    /// store materializes from (`None` declares a manual store) and may
+    /// cross Domains via a `Feed` handle or [`Scoped::abs`].
+    pub async fn define_state_store(
+        &self,
+        spec: crate::store::StateStoreSpec,
+        source: Option<Scoped>,
+    ) -> Result<crate::store::StateStore, SdkError> {
+        let source = match source {
+            Some(scoped) => Some(self.scoped_name(scoped)?),
+            None => None,
+        };
+        self.client
+            .define_state_store(self.rescope(spec)?, source.as_deref())
+            .await
+    }
+
+    /// `DROP STATESTORE <relative>` inside this Domain.
+    pub async fn drop_state_store(&self, relative: &str) -> Result<Vec<Value>, SdkError> {
+        self.client
+            .wcl(&format!("DROP STATESTORE {}", self.resolve(relative)?))
+            .await
+    }
+
+    // ---- Pipes and indexes -----------------------------------------------------------
+
+    /// Bind the declared Pipe handle `relative` inside this Domain.
+    pub fn pipe(&self, relative: &str) -> Result<crate::pipe::Pipe, SdkError> {
+        Ok(self.client.pipe(&self.resolve(relative)?))
+    }
+
+    /// `SHOW PIPES` filtered to this Domain, decoded as [`PipeInfo`]
+    /// rows.
+    pub async fn pipe_infos(&self) -> Result<Vec<crate::pipe::PipeInfo>, SdkError> {
+        Ok(self
+            .client
+            .pipes()
+            .await?
+            .into_iter()
+            .filter(|info| self.owns(&info.name))
+            .collect())
+    }
+
+    /// `DEFINE PIPE` for a forward (copy) Pipe inside this Domain —
+    /// `subscription` stays in-domain (it is the pipe's own frontier);
+    /// `output_feed` is a [`Scoped`] endpoint and may cross Domains via
+    /// a `Feed` handle or [`Scoped::abs`].
+    pub async fn define_forward_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_feed: impl Into<Scoped>,
+    ) -> Result<Vec<Value>, SdkError> {
+        self.client
+            .define_forward_pipe(
+                &self.resolve(name)?,
+                &self.resolve(subscription)?,
+                &self.scoped_name(output_feed)?,
+            )
+            .await
+    }
+
+    /// `DEFINE PIPE` for an enrich Pipe inside this Domain. All output
+    /// endpoints are [`Scoped`] — the lookup store and quarantine Feed
+    /// may live in other Domains via handles or [`Scoped::abs`].
+    pub async fn define_enrich_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_feed: impl Into<Scoped>,
+        output_store: impl Into<Scoped>,
+        operation: impl Into<crate::operations::PipeOperation>,
+        quarantine_feed: Option<Scoped>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let quarantine = match quarantine_feed {
+            Some(scoped) => Some(self.scoped_name(scoped)?),
+            None => None,
+        };
+        self.client
+            .define_enrich_pipe(
+                &self.resolve(name)?,
+                &self.resolve(subscription)?,
+                &self.scoped_name(output_feed)?,
+                &self.scoped_name(output_store)?,
+                operation,
+                quarantine.as_deref(),
+            )
+            .await
+    }
+
+    /// `DEFINE PIPE` for a window Pipe inside this Domain. The pane
+    /// `output_store` and optional `emit_feed` are [`Scoped`] endpoints
+    /// and may cross Domains.
+    pub async fn define_window_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_store: impl Into<Scoped>,
+        operation: impl Into<crate::operations::PipeOperation>,
+        emit_feed: Option<Scoped>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let emit = match emit_feed {
+            Some(scoped) => Some(self.scoped_name(scoped)?),
+            None => None,
+        };
+        self.client
+            .define_window_pipe(
+                &self.resolve(name)?,
+                &self.resolve(subscription)?,
+                &self.scoped_name(output_store)?,
+                operation,
+                emit.as_deref(),
+            )
+            .await
+    }
+
+    /// Query the declared persisted Index `relative` inside this
+    /// Domain — indexes stay same-Domain with their Feed.
+    pub async fn query_index(
+        &self,
+        index: &str,
+        mode: crate::typed::IndexQuery,
+        limit: Option<u64>,
+        strict: bool,
+    ) -> Result<crate::typed::IndexPage, SdkError> {
+        self.client
+            .query_index(&self.resolve(index)?, mode, limit, strict)
+            .await
+    }
+
+    // ---- Feed schema -----------------------------------------------------------------
+
+    /// `SET FEED SCHEMA` on `relative` inside this Domain.
+    pub async fn set_feed_schema(
+        &self,
+        feed: &str,
+        schema: &FeedSchema,
+    ) -> Result<Vec<Value>, SdkError> {
+        self.client
+            .set_feed_schema(&self.resolve(feed)?, schema)
+            .await
+    }
+
+    /// `CLEAR FEED SCHEMA` on `relative` inside this Domain — the Feed
+    /// reverts to inheriting the Domain default.
+    pub async fn clear_feed_schema(&self, feed: &str) -> Result<Vec<Value>, SdkError> {
+        self.client.clear_feed_schema(&self.resolve(feed)?).await
+    }
+
+    // ---- name resolution ---------------------------------------------------------------
+
     /// Resolve `relative` to a full dotted Feed name inside this Domain
     /// — accepts the short form (`"orders"`) or the already-qualified
     /// form (`"shop.orders"`). A name that fails the dotted grammar is
@@ -315,6 +713,28 @@ impl Domain {
     /// cross-domain Reader/Writer construction refuses locally.
     pub(crate) fn owns(&self, feed_name: &str) -> bool {
         feed_name.starts_with(&format!("{}.", self.name))
+    }
+
+    /// Resolve a [`Scoped`] endpoint: `Rel` inside this Domain, `Abs`
+    /// verbatim (validated against the dotted-name grammar).
+    fn scoped_name(&self, scoped: impl Into<Scoped>) -> Result<String, SdkError> {
+        match scoped.into() {
+            Scoped::Rel(name) => self.resolve(&name),
+            Scoped::Abs(name) => dotted(&name),
+        }
+    }
+
+    /// Rebind a [`StateStoreSpec`] under this Domain's name prefix —
+    /// `spec` is declaration intent; the declared store is owned here.
+    fn rescope(
+        &self,
+        spec: crate::store::StateStoreSpec,
+    ) -> Result<crate::store::StateStoreSpec, SdkError> {
+        let mut scoped = crate::store::StateStoreSpec::new(self.resolve(spec.name())?)?;
+        for key in spec.named_keys() {
+            scoped = scoped.add_key(key.name.clone(), key.unique, key.extractor.clone())?;
+        }
+        Ok(scoped)
     }
 
     // ---- snapshot loading ------------------------------------------------------
@@ -450,7 +870,7 @@ impl<K, V> ReaderBuilder<K, V> {
         self.client
             .wcl(&format!(
                 "CREATE READER {} FROM {} START AT {};",
-                self.require_id()?,
+                self.resolved_id()?,
                 self.feed.name(),
                 self.start.wcl()
             ))
@@ -462,8 +882,15 @@ impl<K, V> ReaderBuilder<K, V> {
     /// codec-bound [`FeedReader`].
     pub async fn open(&self) -> Result<FeedReader<K, V>, SdkError> {
         self.feed
-            .open_reader(self.require_id()?, self.max_page_size, &self.start.wcl())
+            .open_reader(&self.resolved_id()?, self.max_page_size, &self.start.wcl())
             .await
+    }
+
+    /// The reader id resolved inside the feed's Domain —
+    /// `reader_id("fulfillment")` on `shop.orders` declares
+    /// `shop.fulfillment`.
+    fn resolved_id(&self) -> Result<String, SdkError> {
+        self.feed.scope(self.require_id()?)
     }
 
     fn require_id(&self) -> Result<&str, SdkError> {
@@ -509,7 +936,7 @@ impl<K, V> WriterBuilder<K, V> {
         self.client
             .wcl(&format!(
                 "CREATE WRITER {} TO {};",
-                self.require_id()?,
+                self.resolved_id()?,
                 self.feed.name()
             ))
             .await
@@ -518,7 +945,13 @@ impl<K, V> WriterBuilder<K, V> {
     /// Declare the Writer when missing, open a session, and return a
     /// codec-bound [`FeedWriter`].
     pub async fn open(&self) -> Result<FeedWriter<K, V>, SdkError> {
-        self.feed.writer(self.require_id()?).await
+        self.feed.writer(&self.resolved_id()?).await
+    }
+
+    /// The writer id resolved inside the feed's Domain —
+    /// `writer_id("ingest")` on `shop.orders` declares `shop.ingest`.
+    fn resolved_id(&self) -> Result<String, SdkError> {
+        self.feed.scope(self.require_id()?)
     }
 
     fn require_id(&self) -> Result<&str, SdkError> {
@@ -564,7 +997,7 @@ fn relative<'a>(domain: &str, full: &'a str) -> &'a str {
 
 /// Dotted-name grammar — lowercase segments
 /// `^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$`, 512 bytes max.
-fn dotted(name: &str) -> Result<String, SdkError> {
+pub(crate) fn dotted(name: &str) -> Result<String, SdkError> {
     let valid = !name.is_empty()
         && name.len() <= 512
         && name.split('.').all(|segment| {

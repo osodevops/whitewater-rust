@@ -8,11 +8,12 @@ projection, and every operation is an HTTP call with freshness evidence.
 ```rust
 use whitewater::{Client, StateStoreSpec, Extractor};
 
-let spec = StateStoreSpec::new("accounts.employees")?
+let accounts = client.create_domain("accounts").await?;
+let spec = StateStoreSpec::new("employees")?           // -> accounts.employees
     .add_key("passport", true, None)?      // unique: one row per value
     .add_key("department", false, None)?;  // non-unique: value -> many rows
 
-let store = client.define_state_store(spec, None).await?;   // manual store
+let store = accounts.define_state_store(spec, None).await?;   // manual store
 ```
 
 `add_key` records declaration intent used by `define_state_store` — named
@@ -26,10 +27,10 @@ history — every named key must declare an `Extractor` projecting each
 source record to the key's values:
 
 ```rust
-let spec = StateStoreSpec::new("ops.customers")?
+let spec = StateStoreSpec::new("customers")?           // -> ops.customers
     .add_key("email", true, Some(Extractor::json("$.email")?))?
     .add_key("tier", false, Some(Extractor::json("$.tier")?))?;
-client.define_state_store(spec, Some("ops.customer.changes")).await?;
+ops.define_state_store(spec, Some("customer.changes".into())).await?;
 ```
 
 Extractors project a committed record to a typed field value:
@@ -115,12 +116,12 @@ freshness evidence.
 
 ## Typed facade
 
-`client.store::<K, V>(name)` binds `Codec`s so keys/values decode at the
+`domain.store::<K, V>(name)` binds `Codec`s so keys/values decode at the
 boundary — `put`/`get`/`find`/`find_by`/`get_or_default` are the
 one-value conveniences over `put_row`/`lookup`/`get_by`:
 
 ```rust
-let typed = client.store::<String, String>("accounts.employees");
+let typed = accounts.store::<String, String>("employees")?;
 typed
     .put_named(
         Uuid::new_v4(),

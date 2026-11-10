@@ -90,32 +90,17 @@ async fn main() -> Result<(), SdkError> {
         ))
         .await?;
 
-    let input = client.feed_with(
-        &format!("{domain}.users.update.request"),
+    let users = client.domain(&domain)?;
+    let input = users.feed_with("users.update.request", Codec::utf8(), Codec::json())?;
+    let output = users.feed_with(
+        "users.update.enriched.request",
         Codec::utf8(),
         Codec::json(),
-    );
-    let output = client.feed_with(
-        &format!("{domain}.users.update.enriched.request"),
-        Codec::utf8(),
-        Codec::json(),
-    );
-    let dlq = client.feed_with(
-        &format!("{domain}.users.update.dlq"),
-        Codec::utf8(),
-        Codec::json(),
-    );
+    )?;
+    let dlq = users.feed_with("users.update.dlq", Codec::utf8(), Codec::json())?;
 
-    let profiles = client.store_with(
-        &format!("{domain}.users.profiles"),
-        Codec::utf8(),
-        Codec::json(),
-    );
-    let counters = client.store_with(
-        &format!("{domain}.users.stats"),
-        Codec::utf8(),
-        Codec::json(),
-    );
+    let profiles = users.store_with("users.profiles", Codec::utf8(), Codec::json())?;
+    let counters = users.store_with("users.stats", Codec::utf8(), Codec::json())?;
 
     let out_writer = output.writer("enricher").await?;
     let dlq_writer = dlq.writer("enricher").await?;

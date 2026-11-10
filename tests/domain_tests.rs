@@ -207,13 +207,13 @@ async fn get_feed_verifies_declaration_against_the_snapshot() {
 async fn a_cross_domain_feed_is_refused_before_any_network_call() {
     let (client, transport) = client(vec![]);
     let shop = client.domain("shop").unwrap();
-    let outside = client.feed("other.orders");
+    let outside = client.domain("other").unwrap().feed("orders").unwrap();
     assert!(matches!(
-        client.create_reader(&shop, &outside),
+        shop.create_reader(&outside),
         Err(SdkError::Refused(_))
     ));
     assert!(matches!(
-        client.create_writer(&shop, &outside),
+        shop.create_writer(&outside),
         Err(SdkError::Refused(_))
     ));
     assert!(transport.take_requests().is_empty());
@@ -225,7 +225,7 @@ async fn reader_builder_requires_the_durable_id() {
     let shop = client.domain("shop").unwrap();
     let orders = shop.feed("orders").unwrap();
     assert!(matches!(
-        client.create_reader(&shop, &orders).unwrap().open().await,
+        shop.create_reader(&orders).unwrap().open().await,
         Err(SdkError::Refused(_))
     ));
     assert!(transport.take_requests().is_empty());
@@ -238,8 +238,8 @@ async fn reader_builder_declares_with_start_then_opens_a_session() {
         open_reader_reply(),
     ]);
     let shop = client.domain("shop").unwrap();
-    let reader = client
-        .create_reader(&shop, &shop.feed("orders").unwrap())
+    let reader = shop
+        .create_reader(&shop.feed("orders").unwrap())
         .unwrap()
         .reader_id("fulfillment")
         .reader_start_point(ReaderStart::Cursor("c1".to_owned()))
@@ -252,10 +252,10 @@ async fn reader_builder_declares_with_start_then_opens_a_session() {
     let script = requests[0].2["script"].as_str().unwrap();
     assert_eq!(
         script,
-        "CREATE READER fulfillment FROM shop.orders START AT CURSOR 'c1'"
+        "CREATE READER shop.fulfillment FROM shop.orders START AT CURSOR 'c1'"
     );
     assert_eq!(requests[1].1, "/v1/readers/open");
-    assert_eq!(requests[1].2["reader"], "fulfillment");
+    assert_eq!(requests[1].2["reader"], "shop.fulfillment");
     assert_eq!(requests[1].2["capacity"], 64);
     assert_eq!(reader.session_epoch(), 3);
 }
@@ -269,7 +269,7 @@ async fn an_existing_reader_resumes_its_acknowledged_frontier() {
         open_reader_reply(),
         (
             409,
-            json!({ "error": "reader 'fulfillment' already exists" }),
+            json!({ "error": "reader 'shop.fulfillment' already exists" }),
         ),
         (
             200,
@@ -282,8 +282,8 @@ async fn an_existing_reader_resumes_its_acknowledged_frontier() {
     ]);
     let shop = client.domain("shop").unwrap();
 
-    let first = client
-        .create_reader(&shop, &shop.feed("orders").unwrap())
+    let first = shop
+        .create_reader(&shop.feed("orders").unwrap())
         .unwrap()
         .reader_id("fulfillment")
         .reader_start_point(ReaderStart::Beginning)
@@ -292,8 +292,8 @@ async fn an_existing_reader_resumes_its_acknowledged_frontier() {
         .unwrap();
     assert_eq!(first.session_epoch(), 3);
 
-    let second = client
-        .create_reader(&shop, &shop.feed("orders").unwrap())
+    let second = shop
+        .create_reader(&shop.feed("orders").unwrap())
         .unwrap()
         .reader_id("fulfillment")
         .reader_start_point(ReaderStart::Beginning)
@@ -310,8 +310,7 @@ async fn an_existing_reader_resumes_its_acknowledged_frontier() {
 async fn declare_without_open_sends_the_create_alone() {
     let (client, transport) = client(vec![(200, json!({ "results": [] }))]);
     let shop = client.domain("shop").unwrap();
-    client
-        .create_reader_named(&shop, "orders")
+    shop.create_reader("orders")
         .unwrap()
         .reader_id("fulfillment")
         .declare()
@@ -321,7 +320,7 @@ async fn declare_without_open_sends_the_create_alone() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].2["script"],
-        "CREATE READER fulfillment FROM shop.orders START AT BEGINNING;"
+        "CREATE READER shop.fulfillment FROM shop.orders START AT BEGINNING;"
     );
 }
 
@@ -332,8 +331,8 @@ async fn writer_builder_declares_and_opens_a_session() {
         open_writer_reply(),
     ]);
     let shop = client.domain("shop").unwrap();
-    let writer = client
-        .create_writer_named(&shop, "orders")
+    let writer = shop
+        .create_writer("orders")
         .unwrap()
         .writer_id("ingest")
         .open()
@@ -343,9 +342,9 @@ async fn writer_builder_declares_and_opens_a_session() {
     let requests = transport.take_requests();
     assert_eq!(
         requests[0].2["script"],
-        "CREATE WRITER ingest TO shop.orders"
+        "CREATE WRITER shop.ingest TO shop.orders"
     );
-    assert_eq!(requests[1].2["script"], "OPEN WRITER SESSION ingest;");
+    assert_eq!(requests[1].2["script"], "OPEN WRITER SESSION shop.ingest;");
     assert_eq!(writer.session_epoch(), 9);
 }
 
@@ -468,21 +467,21 @@ async fn set_and_clear_schema_emit_typed_commands() {
         )
         .await
         .unwrap();
-    client
-        .set_feed_schema(
-            "shop.orders",
-            &FeedSchema {
-                key: Some(SchemaDecl {
-                    format: "text".to_owned(),
-                    subject: None,
-                    definition: None,
-                }),
-                value: None,
-            },
-        )
-        .await
-        .unwrap();
-    client.clear_feed_schema("shop.orders").await.unwrap();
+    let shop = client.domain("shop").unwrap();
+    shop.set_feed_schema(
+        "orders",
+        &FeedSchema {
+            key: Some(SchemaDecl {
+                format: "text".to_owned(),
+                subject: None,
+                definition: None,
+            }),
+            value: None,
+        },
+    )
+    .await
+    .unwrap();
+    shop.clear_feed_schema("orders").await.unwrap();
 
     let requests = transport.take_requests();
     let commands: Vec<Value> = requests
@@ -601,7 +600,7 @@ async fn domain_scoped_builders_and_for_each_ack_per_page() {
     let requests = transport.take_requests();
     assert_eq!(
         requests[0].2["script"],
-        "CREATE WRITER ingest TO shop.orders;"
+        "CREATE WRITER shop.ingest TO shop.orders;"
     );
     let acks = requests
         .iter()
@@ -653,7 +652,7 @@ async fn domain_create_writer_accepts_a_codec_bound_feed() {
     let requests = transport.take_requests();
     assert_eq!(
         requests[0].2["script"],
-        "CREATE WRITER ingest TO shop.orders"
+        "CREATE WRITER shop.ingest TO shop.orders"
     );
     let b64 = base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
@@ -662,4 +661,57 @@ async fn domain_create_writer_accepts_a_codec_bound_feed() {
         .find(|(_, path, _)| path == "/v1/writers/append")
         .expect("typed append hit the wire");
     assert_eq!(body["payload_base64"], b64.encode("{\"total\":9}"));
+}
+
+#[tokio::test]
+async fn scoped_endpoints_resolve_in_domain_or_carry_absolute_names() {
+    let (client, transport) = client(vec![
+        (200, json!({ "results": [] })),   // CREATE SUBSCRIPTION
+        (200, json!({ "results": [{}] })), // define_pipe forward
+        (200, json!({ "results": [{}] })), // define_pipe forward (abs)
+    ]);
+    let purchasing = client.domain("purchasing").unwrap();
+    let warehouse = client.domain("warehouse").unwrap();
+
+    // A bare string source resolves in-domain.
+    warehouse
+        .create_subscription("po.intake", "inbound", None)
+        .await
+        .unwrap();
+    // A Feed handle carries its absolute name across Domains.
+    let orders = purchasing.feed("orders").unwrap();
+    warehouse
+        .create_subscription("po.source", &orders, None)
+        .await
+        .unwrap();
+
+    let requests = transport.take_requests();
+    assert_eq!(
+        requests[0].2["script"],
+        "CREATE SUBSCRIPTION warehouse.po.intake FROM warehouse.inbound START AT BEGINNING;"
+    );
+    assert_eq!(
+        requests[1].2["script"],
+        "CREATE SUBSCRIPTION warehouse.po.source FROM purchasing.orders START AT BEGINNING;"
+    );
+}
+
+#[tokio::test]
+async fn forward_pipe_endpoints_cross_domains_via_scoped() {
+    let (client, transport) = client(vec![(200, json!({ "results": [{}] }))]);
+    let warehouse = client.domain("warehouse").unwrap();
+    let purchasing = client.domain("purchasing").unwrap();
+
+    warehouse
+        .define_forward_pipe("po.relay", "po.intake", Scoped::abs("purchasing.orders"))
+        .await
+        .unwrap();
+
+    let requests = transport.take_requests();
+    let command = &requests[0].2["commands"][0];
+    assert_eq!(command["command"], "define_pipe");
+    assert_eq!(command["name"], "warehouse.po.relay");
+    assert_eq!(command["subscription"], "warehouse.po.intake");
+    assert_eq!(command["output_feed"], "purchasing.orders");
+    let _ = purchasing; // the source Domain is only consulted via the handle form
 }

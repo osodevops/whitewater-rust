@@ -47,6 +47,8 @@ async fn define_forward_pipe_lowers_the_typed_operation() {
         seen: Mutex::new(Vec::new()),
     });
     client(transport.clone())
+        .domain("accounts")
+        .unwrap()
         .define_forward_pipe("accounts.copy", "accounts.flow", "accounts.out")
         .await
         .expect("forward define");
@@ -75,13 +77,15 @@ async fn define_enrich_pipe_carries_the_lookup_contract() {
         EnrichMiss::Quarantine,
     );
     client(transport.clone())
+        .domain("accounts")
+        .unwrap()
         .define_enrich_pipe(
             "accounts.enrich",
             "accounts.flow",
             "accounts.enriched",
             "accounts.users",
             operation,
-            Some("accounts.misses"),
+            Some(Scoped::rel("accounts.misses")),
         )
         .await
         .expect("enrich define");
@@ -124,12 +128,14 @@ async fn define_window_pipe_lowers_bounds_and_refuses_emit_without_lateness() {
     .key_limit(64)
     .byte_limit(1024);
     client
+        .domain("accounts")
+        .unwrap()
         .define_window_pipe(
             "accounts.rollup",
             "accounts.flow",
             "accounts.panes",
             operation,
-            Some("accounts.closed"),
+            Some(Scoped::rel("accounts.closed")),
         )
         .await
         .expect("window define");
@@ -170,10 +176,14 @@ async fn define_methods_refuse_malformed_declarations_locally() {
 
     // A forward operation cannot drive an enrich or window define.
     assert!(client
+        .domain("accounts")
+        .unwrap()
         .define_enrich_pipe("p", "s", "o", "st", PipeOperation::forward(), None)
         .await
         .is_err());
     assert!(client
+        .domain("accounts")
+        .unwrap()
         .define_window_pipe("p", "s", "st", PipeOperation::forward(), None)
         .await
         .is_err());
@@ -186,12 +196,23 @@ async fn define_methods_refuse_malformed_declarations_locally() {
         EnrichMiss::Quarantine,
     );
     assert!(client
+        .domain("accounts")
+        .unwrap()
         .define_enrich_pipe("p", "s", "o", "st", quarantine_miss, None)
         .await
         .is_err());
     let forward_miss = PipeOperation::enrich_default(Extractor::record_key());
     assert!(client
-        .define_enrich_pipe("p", "s", "o", "st", forward_miss, Some("q.feed"))
+        .domain("accounts")
+        .unwrap()
+        .define_enrich_pipe(
+            "p",
+            "s",
+            "o",
+            "st",
+            forward_miss,
+            Some(Scoped::abs("q.feed"))
+        )
         .await
         .is_err());
 
@@ -203,7 +224,9 @@ async fn define_methods_refuse_malformed_declarations_locally() {
     )
     .unwrap();
     assert!(client
-        .define_window_pipe("p", "s", "st", unbounded, Some("out"))
+        .domain("accounts")
+        .unwrap()
+        .define_window_pipe("p", "s", "st", unbounded, Some(Scoped::rel("out")))
         .await
         .is_err());
 
@@ -216,6 +239,8 @@ async fn define_methods_refuse_malformed_declarations_locally() {
     .unwrap()
     .grace(Duration::from_secs(1));
     assert!(client
+        .domain("accounts")
+        .unwrap()
         .define_window_pipe("p", "s", "st", grace_alone, None)
         .await
         .is_err());
@@ -228,6 +253,8 @@ async fn define_methods_refuse_malformed_declarations_locally() {
     .time(WindowTime::Ingest)
     .watermark(Duration::from_secs(1));
     assert!(client
+        .domain("accounts")
+        .unwrap()
         .define_window_pipe("p", "s", "st", ingest_late, None)
         .await
         .is_err());
@@ -247,6 +274,8 @@ async fn define_methods_refuse_malformed_declarations_locally() {
     .unwrap()
     .key_limit(WINDOW_MAX_KEY_LIMIT + 1);
     assert!(client
+        .domain("accounts")
+        .unwrap()
         .define_window_pipe("p", "s", "st", oversized, None)
         .await
         .is_err());
@@ -270,7 +299,9 @@ async fn define_state_store_lowers_named_keys_and_source() {
         .add_key("region", false, Some(Extractor::record_key()))
         .unwrap();
     client
-        .define_state_store(spec, Some("accounts.signups"))
+        .domain("accounts")
+        .unwrap()
+        .define_state_store(spec, Some("accounts.signups".into()))
         .await
         .expect("feed-sourced define");
     let commands = transport.seen.lock().unwrap()[0]["commands"].clone();
@@ -301,6 +332,8 @@ async fn define_state_store_lowers_named_keys_and_source() {
         .add_key("department", false, None)
         .unwrap();
     client
+        .domain("accounts")
+        .unwrap()
         .define_state_store(spec, None)
         .await
         .expect("manual define");
@@ -328,14 +361,24 @@ async fn define_state_store_refuses_extractor_source_mismatches() {
         .unwrap()
         .add_key("k", false, Some(Extractor::record_key()))
         .unwrap();
-    assert!(client.define_state_store(spec, None).await.is_err());
+    assert!(client
+        .domain("ops")
+        .unwrap()
+        .define_state_store(spec, None)
+        .await
+        .is_err());
 
     // Feed-sourced store missing an extractor refuses.
     let spec = StateStoreSpec::new("s")
         .unwrap()
         .add_key("k", false, None)
         .unwrap();
-    assert!(client.define_state_store(spec, Some("f")).await.is_err());
+    assert!(client
+        .domain("ops")
+        .unwrap()
+        .define_state_store(spec, Some("f".into()))
+        .await
+        .is_err());
 
     // Spec-builder bounds refuse locally too.
     assert!(StateStoreSpec::new("  ").is_err());
@@ -365,7 +408,9 @@ async fn create_subscription_lowers_to_the_wcl_statement() {
     let client = client(transport.clone());
 
     client
-        .create_subscription("orders.sub", "ops.orders", None)
+        .domain("orders")
+        .unwrap()
+        .create_subscription("orders.sub", Scoped::abs("ops.orders"), None)
         .await
         .expect("default start");
     assert_eq!(
@@ -374,9 +419,11 @@ async fn create_subscription_lowers_to_the_wcl_statement() {
     );
 
     client
+        .domain("orders")
+        .unwrap()
         .create_subscription(
             "orders.sub2",
-            "ops.orders",
+            Scoped::abs("ops.orders"),
             Some(ReaderStart::Cursor("cur'sor".to_owned())),
         )
         .await

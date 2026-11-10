@@ -32,12 +32,11 @@ async fn main() -> Result<(), whitewater::SdkError> {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
-    client.wcl(&format!("CREATE DOMAIN {domain_name};")).await?;
-
-    // get_domain verifies existence and materializes the catalog
-    // snapshot in one batched control read; create_feed declares the
-    // feed inside the Domain's prefix.
-    let shop = client.get_domain(&domain_name).await?;
+    let shop = client.create_domain(&domain_name).await?;
+    // create_domain returns the lazy Domain handle — get_domain(name)
+    // instead verifies existence and materializes the catalog snapshot
+    // in one batched control read. create_feed declares the feed inside
+    // the Domain's prefix.
     shop.create_feed("orders").await?;
     println!("domain id: {}", shop.domain_id().await?);
     println!("feeds:     {:?}", shop.feed_names().await?);
@@ -47,11 +46,10 @@ async fn main() -> Result<(), whitewater::SdkError> {
     let orders = shop.feed("orders")?;
 
     // Builders hang off the Domain — a typed Feed handle keeps its
-    // codecs (client.create_writer(&shop, &orders)), while the
-    // relative-name form shop.create_writer("orders") resolves inside
-    // the Domain.
-    let writer = client
-        .create_writer(&shop, &orders)?
+    // codecs (shop.create_writer(&orders)), while the relative-name
+    // form shop.create_writer("orders") resolves inside the Domain.
+    let writer = shop
+        .create_writer(&orders)?
         .writer_id("ingest")
         .open()
         .await?;

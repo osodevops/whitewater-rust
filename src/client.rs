@@ -428,7 +428,7 @@ impl Client {
 
     /// Bind a declared Writer for appends: `OPEN WRITER SESSION` pins the
     /// session epoch the server fences every append against.
-    pub async fn writer(&self, name: &str) -> Result<Writer, SdkError> {
+    pub(crate) async fn writer(&self, name: &str) -> Result<Writer, SdkError> {
         let base = self.base().to_owned();
         let results = self.wcl(&format!("OPEN WRITER SESSION {name};")).await?;
         let epoch = results
@@ -455,7 +455,7 @@ impl Client {
 
     /// Bind a declared Reader: `reader.open` returns the session epoch
     /// and the current delivered/acknowledged cursors.
-    pub async fn reader(&self, name: &str, capacity: u64) -> Result<Reader, SdkError> {
+    pub(crate) async fn reader(&self, name: &str, capacity: u64) -> Result<Reader, SdkError> {
         let base = self.base().to_owned();
         let body = self
             .call(
@@ -493,7 +493,7 @@ impl Client {
     /// `start` defaults to [`ReaderStart::Beginning`]; `Now`,
     /// `Cursor`, and `TimestampNs` select other starts. Names pass
     /// through verbatim — the server enforces the dotted-name grammar.
-    pub async fn create_subscription(
+    pub(crate) async fn create_subscription(
         &self,
         name: &str,
         feed: &str,
@@ -508,7 +508,7 @@ impl Client {
     }
 
     /// Join a Subscription as a cooperating member.
-    pub async fn member(&self, subscription: &str) -> Result<Member, SdkError> {
+    pub(crate) async fn member(&self, subscription: &str) -> Result<Member, SdkError> {
         let base = self.base().to_owned();
         let member_id = Uuid::new_v4();
         let body = self
@@ -539,7 +539,7 @@ impl Client {
     /// first — a bulk history walk never pays the server-side base64 +
     /// JSON pass — and transparently reads the JSON shape when the
     /// serving Node or scripted transport does not speak frames.
-    pub async fn records(
+    pub(crate) async fn records(
         &self,
         feed: &str,
         after: Option<&str>,
@@ -599,7 +599,7 @@ impl Client {
 
     /// Bind a declared StateStore handle — no call; operations resolve
     /// the store per request and map its typed errors.
-    pub fn state_store(&self, name: &str) -> StateStore {
+    pub(crate) fn state_store(&self, name: &str) -> StateStore {
         StateStore {
             client: self.clone(),
             name: name.to_owned(),
@@ -608,14 +608,14 @@ impl Client {
 
     /// Byte-level alias of `state_store` for call sites that read better
     /// next to the codec-bound [`Store`].
-    pub fn state_store_raw(&self, name: &str) -> StateStore {
+    pub(crate) fn state_store_raw(&self, name: &str) -> StateStore {
         self.state_store(name)
     }
 
     /// Codec-bound declared StateStore: UTF-8 strings both ways —
     /// plain JSON flows with no codec ceremony; [`store_with`] with
     /// [`Codec::bytes`] opts into raw binary.
-    pub fn store(&self, name: &str) -> Store<String, String> {
+    pub(crate) fn store(&self, name: &str) -> Store<String, String> {
         Store {
             inner: self.state_store(name),
             key_codec: Codec::utf8(),
@@ -624,7 +624,7 @@ impl Client {
     }
 
     /// Codec-bound declared StateStore with explicit codecs.
-    pub fn store_with<K, V>(
+    pub(crate) fn store_with<K, V>(
         &self,
         name: &str,
         key_codec: Codec<K>,
@@ -641,7 +641,7 @@ impl Client {
     /// un-schema-backed JSON flows with zero codec ceremony;
     /// [`feed_with`] with [`Codec::bytes`] is the escape hatch to raw
     /// bytes.
-    pub fn feed(&self, name: &str) -> Feed<String, String> {
+    pub(crate) fn feed(&self, name: &str) -> Feed<String, String> {
         Feed {
             client: self.clone(),
             name: name.to_owned(),
@@ -653,7 +653,7 @@ impl Client {
     /// Codec-bound declared Feed with explicit key/value codecs — JSON
     /// payloads use `Codec::json::<T>()`, custom formats use
     /// `Codec::custom`.
-    pub fn feed_with<K, V>(
+    pub(crate) fn feed_with<K, V>(
         &self,
         name: &str,
         key_codec: Codec<K>,
@@ -670,7 +670,7 @@ impl Client {
     /// Bind a declared Pipe for lifecycle operations: `describe`
     /// reports the live catalog row while `pause`/`resume`/`drop`
     /// drive the same typed commands WCL lowers to.
-    pub fn pipe(&self, name: &str) -> Pipe {
+    pub(crate) fn pipe(&self, name: &str) -> Pipe {
         Pipe::new(self.clone(), name.to_owned())
     }
 
@@ -711,7 +711,7 @@ impl Client {
 
     /// `set_feed_schema(feed, schema)` issues `SET SCHEMA ON FEED` —
     /// overrides the Domain's declared schema for the named sides.
-    pub async fn set_feed_schema(
+    pub(crate) async fn set_feed_schema(
         &self,
         feed: &str,
         schema: &FeedSchema,
@@ -729,7 +729,10 @@ impl Client {
 
     /// `clear_feed_schema(feed)` issues `DROP SCHEMA ON FEED` — the
     /// Feed reverts to inheriting its Domain's declared schema.
-    pub async fn clear_feed_schema(&self, feed: &str) -> Result<Vec<serde_json::Value>, SdkError> {
+    pub(crate) async fn clear_feed_schema(
+        &self,
+        feed: &str,
+    ) -> Result<Vec<serde_json::Value>, SdkError> {
         self.clear_schema("feed", feed).await
     }
 
@@ -759,7 +762,7 @@ impl Client {
         .await
     }
 
-    pub fn create_reader<K, V>(
+    pub(crate) fn create_reader<K, V>(
         &self,
         domain: &Domain,
         feed: &Feed<K, V>,
@@ -774,20 +777,9 @@ impl Client {
         Ok(ReaderBuilder::new(self.clone(), feed.clone()))
     }
 
-    /// [`Client::create_reader`] taking a feed name relative to `domain`
-    /// (`"orders"` resolves to `shop.orders`) with UTF-8 keys and byte
-    /// payloads.
-    pub fn create_reader_named(
-        &self,
-        domain: &Domain,
-        feed: &str,
-    ) -> Result<ReaderBuilder<String, String>, SdkError> {
-        self.create_reader(domain, &domain.feed(feed)?)
-    }
-
     /// A fluent [`WriterBuilder`] bound to `feed` — `feed` must belong
     /// to `domain` (validated locally before any network call).
-    pub fn create_writer<K, V>(
+    pub(crate) fn create_writer<K, V>(
         &self,
         domain: &Domain,
         feed: &Feed<K, V>,
@@ -802,22 +794,12 @@ impl Client {
         Ok(WriterBuilder::new(self.clone(), feed.clone()))
     }
 
-    /// [`Client::create_writer`] taking a feed name relative to
-    /// `domain` with UTF-8 string keys and payloads.
-    pub fn create_writer_named(
-        &self,
-        domain: &Domain,
-        feed: &str,
-    ) -> Result<WriterBuilder<String, String>, SdkError> {
-        self.create_writer(domain, &domain.feed(feed)?)
-    }
-
     /// `DEFINE PIPE` for a forward (copy) Pipe: each record the
     /// Subscription delivers lands unchanged on `output_feed`. Names
     /// pass through verbatim — the server enforces the dotted-name
     /// grammar and returns the catalog row as a [`PipeInfo`]-shaped
     /// result entry.
-    pub async fn define_forward_pipe(
+    pub(crate) async fn define_forward_pipe(
         &self,
         name: &str,
         subscription: &str,
@@ -841,7 +823,7 @@ impl Client {
     /// miss-quarantine target and is valid only when the operation's
     /// `on_miss` is [`EnrichMiss::Quarantine`]; that combination is
     /// also required — a quarantine miss without a feed refuses locally.
-    pub async fn define_enrich_pipe(
+    pub(crate) async fn define_enrich_pipe(
         &self,
         name: &str,
         subscription: &str,
@@ -893,7 +875,7 @@ impl Client {
     /// rejects. `emit_feed` publishes closed panes and requires the
     /// operation to declare `max_late_ns` or `watermark_ns` — without a
     /// lateness bound no pane ever provably closes.
-    pub async fn define_window_pipe(
+    pub(crate) async fn define_window_pipe(
         &self,
         name: &str,
         subscription: &str,
@@ -927,7 +909,7 @@ impl Client {
     /// Feed-sourced named keys must each declare an `extractor` so
     /// replay can project typed values; extractors on a manual store
     /// are refused.
-    pub async fn define_state_store(
+    pub(crate) async fn define_state_store(
         &self,
         spec: StateStoreSpec,
         source: Option<&str>,
@@ -974,8 +956,20 @@ impl Client {
         Ok(self.state_store(spec.name()))
     }
 
+    /// `CREATE DOMAIN <name>` and return the lazy [`Domain`] handle —
+    /// the only front door for Feeds, Writers, Readers, Subscriptions,
+    /// Pipes, StateStores, and Indexes. Use [`Client::domain`] for a
+    /// handle without declaring, [`Client::get_domain`] to verify and
+    /// materialize the catalog.
+    pub async fn create_domain(&self, name: &str) -> Result<Domain, SdkError> {
+        let domain = Domain::new(self.clone(), name)?;
+        self.wcl(&format!("CREATE DOMAIN {}", domain.name()))
+            .await?;
+        Ok(domain)
+    }
+
     /// `SHOW PIPES` decoded as [`PipeInfo`] rows.
-    pub async fn pipes(&self) -> Result<Vec<PipeInfo>, SdkError> {
+    pub(crate) async fn pipes(&self) -> Result<Vec<PipeInfo>, SdkError> {
         let results = self
             .commands(vec![json!({ "command": "show", "kind": "pipes" })])
             .await?;
@@ -991,7 +985,7 @@ impl Client {
     /// Temporary read against a Feed without declaring a Reader:
     /// bounded history walks, live tails, or fresh-only waits per
     /// `options` — see `TemporaryFetch`.
-    pub async fn temporary_fetch(
+    pub(crate) async fn temporary_fetch(
         &self,
         feed: &str,
         options: TemporaryFetch,
@@ -1036,7 +1030,7 @@ impl Client {
     /// them — a bulk replay never pays server-side base64 + JSON
     /// encode/decode. The records are the same [`Record`]s a JSON page
     /// returns.
-    pub async fn temporary_fetch_frames(
+    pub(crate) async fn temporary_fetch_frames(
         &self,
         feed: &str,
         options: TemporaryFetch,
@@ -1072,7 +1066,7 @@ impl Client {
     /// launch; 0 behaves like the sequential call). Pages yield in
     /// order; an error or an empty page (with no `wait_ms`) ends the
     /// stream.
-    pub fn temporary_fetch_frames_pipelined(
+    pub(crate) fn temporary_fetch_frames_pipelined(
         &self,
         feed: &str,
         options: TemporaryFetch,
@@ -1096,7 +1090,7 @@ impl Client {
     /// prefix, or range matching per `sdk/spec/endpoints.json`; `strict`
     /// bounded-waits for the serving Node's checkpoint to reach the
     /// activation frontier, surfacing `IndexBehind` when it cannot.
-    pub async fn query_index(
+    pub(crate) async fn query_index(
         &self,
         index: &str,
         mode: IndexQuery,

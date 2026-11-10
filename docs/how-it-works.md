@@ -133,14 +133,14 @@ Builder semantics:
 
 Three shapes, in increasing durability:
 
-1. **`client.records(feed, after, limit)`** — one-shot committed
+1. **`domain.records(feed, after, limit)`** — one-shot committed
    history page (binary-first: `Accept: application/vnd.whitewater.frames`,
    JSON fallback for Nodes that ignore the Accept).
-2. **`client.temporary_fetch(fetch)` /
+2. **`domain.temporary_fetch(feed, fetch)` /
    `temporary_fetch_frames[_pipelined]`** — anonymous ephemeral reader;
    `tail` + `wait_ms` is a server-side long-poll. Continue with
    `next_cursor`, never the last record's cursor.
-3. **`client.reader(name, capacity)`** — durable independent cursor:
+3. **`domain.reader(name, capacity)`** — durable independent cursor:
    `open` → `fetch`/`fetch_and_ack` → `ack` → `close`. Progress
    survives restarts; `fetch` requests the binary page and updates
    `delivered_cursor`/`acknowledged_cursor`/pacing advice from the
@@ -150,7 +150,7 @@ Three shapes, in increasing durability:
 the page limit while pages return full — the read-side sibling of the
 writer's `Batching`/`AutoTune` tuning.
 
-`client.member(subscription)` is the lease vocabulary for cooperating
+`domain.member(subscription)` is the lease vocabulary for cooperating
 consumers: `join` → `claim`/`renew`/`release` → `fetch` (the
 `member-frames` wire: `u32 meta_len` + metadata JSON + frame page,
 with `cursor`/`positions`/`delivery_attempt`/`next_delivery_ns`
@@ -158,7 +158,7 @@ carried back) → `ack`.
 
 ## Writing
 
-- **Named session**: `client.writer(name)` opens `OPEN WRITER SESSION`
+- **Named session**: `domain.writer(name)` opens `OPEN WRITER SESSION`
   and pins the returned `session_epoch`; `writer.append` /
   `append_batch` dedup on `request_id` and can speak the FSA1 binary
   append body.

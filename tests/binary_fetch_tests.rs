@@ -149,7 +149,12 @@ async fn reader_fetch_binary_page_carries_pacing_headers() {
             ("x-whitewater-retry-after-ms".to_owned(), "40".to_owned()),
         ],
     );
-    let mut reader = client.reader("orders.rd", 64).await.unwrap();
+    let mut reader = client
+        .domain("orders")
+        .unwrap()
+        .reader("rd", 64)
+        .await
+        .unwrap();
     let page = reader.fetch(16).await.unwrap();
     assert_eq!(page.records.len(), 1);
     assert_eq!(page.records[0].key, b"k1");
@@ -177,7 +182,12 @@ async fn reader_fetch_binary_error_maps_the_json_body() {
             body: serde_json::to_vec(&json!({"error": "old", "code": "stale_epoch"})).unwrap(),
             headers: Vec::new(),
         });
-    let mut reader = client.reader("orders.rd", 64).await.unwrap();
+    let mut reader = client
+        .domain("orders")
+        .unwrap()
+        .reader("rd", 64)
+        .await
+        .unwrap();
     assert_eq!(reader.fetch(1).await.unwrap_err(), SdkError::StaleEpoch);
 }
 
@@ -268,7 +278,12 @@ async fn records_walk_uses_the_binary_get_page() {
         Some("rc-2".to_owned()),
         Vec::new(),
     );
-    let records = client.records("orders.events", None, 2).await.unwrap();
+    let records = client
+        .domain("orders")
+        .unwrap()
+        .records("events", None, 2)
+        .await
+        .unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].key, b"ka");
     assert_eq!(records[1].cursor.as_deref(), Some("rc-2"));
@@ -359,7 +374,12 @@ async fn json_only_transports_fall_back_on_every_binary_wire() {
         ),
     });
     let client = Client::new(transport, vec!["http://node1".to_owned()], "k").expect("client");
-    let mut reader = client.reader("orders.rd", 64).await.unwrap();
+    let mut reader = client
+        .domain("orders")
+        .unwrap()
+        .reader("rd", 64)
+        .await
+        .unwrap();
     assert_eq!(reader.fetch(1).await.unwrap().records.len(), 1);
     let member = Member::for_testing(client.clone(), "orders.flow", Uuid::new_v4(), 1);
     let work = ClaimedWork {
@@ -370,7 +390,9 @@ async fn json_only_transports_fall_back_on_every_binary_wire() {
     assert_eq!(member.fetch(&work, 1).await.unwrap().records.len(), 1);
     assert_eq!(
         client
-            .records("orders.events", None, 1)
+            .domain("orders")
+            .unwrap()
+            .records("events", None, 1)
             .await
             .unwrap()
             .len(),

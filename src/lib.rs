@@ -28,11 +28,12 @@
 //!     vec!["https://node1:7371".to_owned()],
 //!     "api-key",
 //! )?;
-//! let orders = client.feed_with(
-//!     "orders.events",
+//! let orders_domain = client.domain("orders")?;
+//! let orders = orders_domain.feed_with(
+//!     "events",
 //!     Codec::utf8(),
 //!     Codec::<serde_json::Value>::json(),
-//! );
+//! )?;
 //! let mut reader = orders.reader("audit", 64).await?;
 //! let page = reader.fetch(16).await?;
 //! reader.ack().await?;
@@ -65,7 +66,10 @@ pub use client::Client;
 pub use codec::Codec;
 pub use consumer::{ConsumerHandle, FeedConsumer, ReaderStart};
 pub use demand::{DemandReport, DemandRow, HotKey};
-pub use domain::{Domain, FeedSchema, IntoDomainFeed, ReaderBuilder, SchemaDecl, WriterBuilder};
+pub use domain::{
+    Domain, FeedSchema, IntoDomainFeed, ReaderBuilder, SchemaDecl, Scoped, SubscriptionRef,
+    WriterBuilder,
+};
 pub use error::SdkError;
 pub use feed::{
     Feed, FeedEvent, FeedMessage, FeedPage, FeedReader, FeedReaderPage, FeedWriter, Subscription,

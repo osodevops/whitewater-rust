@@ -83,12 +83,32 @@ fn record_json(key: &[u8], payload: &[u8]) -> Value {
     })
 }
 
+fn orders(client: &Client) -> Domain {
+    client.domain("orders").unwrap()
+}
+
+fn crm(client: &Client) -> Domain {
+    client.domain("crm").unwrap()
+}
+
 async fn open_writer(client: &Client, name: &str) -> Writer {
-    client.writer(name).await.expect("open writer")
+    let (domain, rel) = name.split_once('.').unwrap();
+    client
+        .domain(domain)
+        .unwrap()
+        .writer(rel)
+        .await
+        .expect("open writer")
 }
 
 async fn open_reader(client: &Client, name: &str) -> Reader {
-    client.reader(name, 64).await.expect("open reader")
+    let (domain, rel) = name.split_once('.').unwrap();
+    client
+        .domain(domain)
+        .unwrap()
+        .reader(rel, 64)
+        .await
+        .expect("open reader")
 }
 
 #[test]
@@ -124,7 +144,10 @@ async fn error_mapping_follows_status_and_code_not_text() {
             None => json!({"error": "x"}),
         };
         let (client, _transport) = client(vec![(status, body)]);
-        let error = client.records("orders.events", None, 1).await.unwrap_err();
+        let error = orders(&client)
+            .records("events", None, 1)
+            .await
+            .unwrap_err();
         assert_eq!(error, want, "{status}/{code:?}");
     }
     assert!(SdkError::Ambiguous(String::new()).retryable());
@@ -325,7 +348,7 @@ async fn put_row_carries_mutation_id_and_typed_named_postings() {
             "deduplicated": false
         }),
     )]);
-    let store = client.state_store("crm.accounts");
+    let store = crm(&client).state_store("accounts").unwrap();
     let outcome = store
         .put_row(
             Uuid::new_v4(),
@@ -360,8 +383,9 @@ async fn get_by_sends_typed_values_and_decodes_freshness() {
             "served_by": "node-2"
         }),
     )]);
-    let page = client
-        .state_store("crm.accounts")
+    let page = crm(&client)
+        .state_store("accounts")
+        .unwrap()
         .get_by(
             "region",
             &[TypedValue::Text("emea".to_owned())],
@@ -387,7 +411,7 @@ async fn index_range_query_flattens_mode_and_bounds() {
     let (client, transport) = client(vec![(
         200,
         json!({
-            "index": "crm.by_region",
+            "index": "crm.byregion",
             "index_id": Uuid::nil().to_string(),
             "generation": 2,
             "rows": [],
@@ -398,9 +422,9 @@ async fn index_range_query_flattens_mode_and_bounds() {
             "served_by": "node-1"
         }),
     )]);
-    client
+    crm(&client)
         .query_index(
-            "crm.by_region",
+            "byregion",
             IndexQuery::Range {
                 leading: vec![TypedValue::Text("emea".to_owned())],
                 lower: IndexBound {
@@ -432,8 +456,8 @@ async fn index_behind_maps_to_a_retryable_typed_error() {
         409,
         json!({"error": "freshness", "code": "index_behind"}),
     )]);
-    let error = client
-        .query_index("crm.by_region", IndexQuery::Exact(vec![]), None, true)
+    let error = crm(&client)
+        .query_index("byregion", IndexQuery::Exact(vec![]), None, true)
         .await
         .unwrap_err();
     assert_eq!(error, SdkError::IndexBehind);
@@ -443,9 +467,9 @@ async fn index_behind_maps_to_a_retryable_typed_error() {
 #[tokio::test]
 async fn temporary_fetch_carries_flags_and_decimal_nanos() {
     let (client, transport) = client(vec![(200, json!({"records": [], "next_cursor": "c-9"}))]);
-    let page = client
+    let page = orders(&client)
         .temporary_fetch(
-            "orders.events",
+            "events",
             TemporaryFetch {
                 after: Some("resume-1".to_owned()),
                 limit: 25,
@@ -469,8 +493,8 @@ async fn temporary_fetch_carries_flags_and_decimal_nanos() {
 #[tokio::test]
 async fn records_passes_the_opaque_cursor_verbatim() {
     let (client, transport) = client(vec![(200, json!([record_json(b"k", b"v")]))]);
-    let records = client
-        .records("orders.events", Some("opaque+cursor/bytes="), 10)
+    let records = orders(&client)
+        .records("events", Some("opaque+cursor/bytes="), 10)
         .await
         .unwrap();
     assert_eq!(records.len(), 1);
@@ -501,7 +525,12 @@ async fn pipe_facade_wires_lifecycle_and_decodes_catalog_rows() {
         (200, json!({"results": [{}]})),
     ]);
     // describe decodes the catalog row verbatim.
-    let described = client.pipe("orders.relay").describe().await.unwrap();
+    let described = orders(&client)
+        .pipe("relay")
+        .unwrap()
+        .describe()
+        .await
+        .unwrap();
     assert_eq!(described.name, "orders.relay");
     assert_eq!(described.stage, "paused");
     assert_eq!(described.subscription_id.to_string(), subscription_id);
@@ -512,11 +541,21 @@ async fn pipe_facade_wires_lifecycle_and_decodes_catalog_rows() {
     );
     assert_eq!(described.output_store_id, None);
     // pipes lists the same row; lifecycle commands post the typed verbs.
-    let listed = client.pipes().await.unwrap();
+    let listed = orders(&client).pipe_infos().await.unwrap();
     assert_eq!(listed.len(), 1);
-    client.pipe("orders.relay").pause().await.unwrap();
-    client.pipe("orders.relay").resume().await.unwrap();
-    client.pipe("orders.relay").drop().await.unwrap();
+    orders(&client)
+        .pipe("relay")
+        .unwrap()
+        .pause()
+        .await
+        .unwrap();
+    orders(&client)
+        .pipe("relay")
+        .unwrap()
+        .resume()
+        .await
+        .unwrap();
+    orders(&client).pipe("relay").unwrap().drop().await.unwrap();
     let requests = transport.take_requests();
     let command = |index: usize| requests[index].2["commands"][0].clone();
     assert_eq!(command(0)["command"], "describe");
@@ -600,7 +639,9 @@ async fn feed_writer_declares_and_encodes_through_codecs() {
             }),
         ),
     ]);
-    let feed = client.feed_with("orders.events", Codec::utf8(), Codec::<Order>::json());
+    let feed = orders(&client)
+        .feed_with("events", Codec::utf8(), Codec::<Order>::json())
+        .unwrap();
     let writer = feed.writer("checkout").await.unwrap();
     let order = Order {
         id: "o-1".to_owned(),
@@ -635,7 +676,7 @@ async fn feed_writer_append_event_pins_identity_time_and_metadata() {
             }),
         ),
     ]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let writer = feed.writer("checkout").await.unwrap();
     let request_id = Uuid::new_v4();
     let outcome = writer
@@ -667,7 +708,7 @@ async fn feed_writer_keyless_event_sends_an_empty_key() {
             }),
         ),
     ]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let writer = feed.writer("checkout").await.unwrap();
     writer
         .append_event(FeedEvent::keyless("heartbeat".to_owned()))
@@ -690,7 +731,7 @@ async fn feed_writer_batch_encodes_each_record() {
             ]}),
         ),
     ]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let writer = feed.writer("checkout").await.unwrap();
     let outcomes = writer
         .append_batch(&[
@@ -709,7 +750,7 @@ async fn feed_writer_batch_encodes_each_record() {
 #[tokio::test]
 async fn feed_writer_propagates_a_non_exists_create_failure() {
     let (client, _transport) = client(vec![(400, json!({"error": "invalid name: BAD NAME"}))]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let error = feed.writer("bad").await.err().unwrap();
     assert!(matches!(error, SdkError::Refused(_)), "{error:?}");
 }
@@ -720,7 +761,7 @@ async fn feed_writer_tolerates_an_existing_declaration() {
         (400, json!({"error": "resource already exists: wr"})),
         (200, json!({"results": [{"data": {"session_epoch": 2}}]})),
     ]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let writer = feed.writer("checkout").await.unwrap();
     assert_eq!(writer.session_epoch(), 2);
 }
@@ -754,7 +795,7 @@ async fn feed_reader_decodes_pages_and_acks_delivered_cursor() {
         ),
         (200, json!({"acknowledged_cursor": "page-9"})),
     ]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let mut reader = feed.reader("audit", 64).await.unwrap();
     let page = reader.fetch(0).await.unwrap();
     assert_eq!(page.records.len(), 2);
@@ -784,7 +825,9 @@ async fn feed_reader_json_decodes_typed_values() {
             }),
         ),
     ]);
-    let feed = client.feed_with("orders.events", Codec::utf8(), Codec::<Order>::json());
+    let feed = orders(&client)
+        .feed_with("events", Codec::utf8(), Codec::<Order>::json())
+        .unwrap();
     let mut reader = feed.reader("audit", 64).await.unwrap();
     let page = reader.fetch(0).await.unwrap();
     assert_eq!(
@@ -810,7 +853,7 @@ async fn feed_records_decode_and_preserve_envelope_fields() {
             "cursor": "opaque-cursor"
         }]),
     )]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let records = feed.records(None, 10).await.unwrap();
     assert_eq!(records.len(), 1);
     let message = &records[0];
@@ -824,7 +867,7 @@ async fn feed_records_decode_and_preserve_envelope_fields() {
 #[tokio::test]
 async fn feed_load_reads_from_the_beginning() {
     let (client, transport) = client(vec![(200, json!([record_json(b"k", b"v")]))]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let records = feed.load(10).await.unwrap();
     assert_eq!(records.len(), 1);
     let requests = transport.take_requests();
@@ -841,7 +884,7 @@ async fn feed_fetch_decodes_temporary_pages() {
             "next_cursor": "next-3"
         }),
     )]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let page = feed
         .fetch(TemporaryFetch {
             tail: true,
@@ -858,7 +901,7 @@ async fn feed_fetch_decodes_temporary_pages() {
 #[tokio::test]
 async fn feed_view_rebinds_codecs_without_a_wire_call() {
     let (client, transport) = client(vec![]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let rebound: Feed<String, Order> = feed.view(Codec::utf8(), Codec::json());
     assert_eq!(rebound.name(), "orders.events");
     assert!(transport.take_requests().is_empty());
@@ -875,7 +918,7 @@ async fn feed_records_surface_codec_failures_as_codec_errors() {
             "event_time_ns": "1", "ingest_time_ns": "2"
         }]),
     )]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let error = feed.records(None, 10).await.unwrap_err();
     assert!(matches!(error, SdkError::Codec(_)), "{error:?}");
 }
@@ -895,7 +938,7 @@ async fn subscribe_delivers_batches_and_acks_progress() {
         ),
         (200, json!({"acknowledged_cursor": "d-1"})),
     ]);
-    let feed = client.feed("orders.events");
+    let feed = orders(&client).feed("events").unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
     let tx = std::sync::Mutex::new(Some(tx));
     let subscription = feed
@@ -940,7 +983,9 @@ fn mutation_reply() -> Value {
 #[tokio::test]
 async fn store_put_encodes_key_and_payload_through_codecs() {
     let (client, transport) = client(vec![(200, mutation_reply())]);
-    let store = client.store_with("crm.accounts", Codec::utf8(), Codec::<Order>::json());
+    let store = crm(&client)
+        .store_with("accounts", Codec::utf8(), Codec::<Order>::json())
+        .unwrap();
     store
         .put(
             Uuid::new_v4(),
@@ -976,7 +1021,7 @@ async fn store_get_decodes_rows_and_passes_freshness_through() {
             "served_by": "node-3"
         }),
     )]);
-    let store = client.store("crm.accounts");
+    let store = crm(&client).store("accounts").unwrap();
     let lookup = store.get(&"acct-1".to_owned(), true).await.unwrap();
     let row = lookup.row.expect("row found");
     assert_eq!(row.key, "acct-1");
@@ -991,7 +1036,7 @@ async fn store_get_returns_none_for_a_miss() {
         200,
         json!({"found": false, "applied_seq": 9, "committed_seq": 9}),
     )]);
-    let store = client.store("crm.accounts");
+    let store = crm(&client).store("accounts").unwrap();
     let lookup = store.get(&"absent".to_owned(), false).await.unwrap();
     assert!(lookup.row.is_none());
 }
@@ -1007,7 +1052,7 @@ async fn store_iterate_decodes_rows_and_continuation_key() {
             "served_by": "node-1"
         }),
     )]);
-    let store = client.store("crm.accounts");
+    let store = crm(&client).store("accounts").unwrap();
     let page = store
         .iterate(Some(&"k0".to_owned()), Some(50))
         .await
@@ -1033,7 +1078,7 @@ async fn store_delete_clear_and_get_by_stay_typed() {
             }),
         ),
     ]);
-    let store = client.store("crm.accounts");
+    let store = crm(&client).store("accounts").unwrap();
     store.delete(Uuid::new_v4(), &"k".to_owned()).await.unwrap();
     store.clear(Uuid::new_v4()).await.unwrap();
     let page = store
@@ -1051,7 +1096,7 @@ async fn store_delete_clear_and_get_by_stay_typed() {
 #[tokio::test]
 async fn store_view_rebinds_codecs_without_a_wire_call() {
     let (client, transport) = client(vec![]);
-    let store = client.store("crm.accounts");
+    let store = crm(&client).store("accounts").unwrap();
     let rebound: Store<String, Order> = store.view(Codec::utf8(), Codec::json());
     assert_eq!(rebound.name(), "crm.accounts");
     assert!(transport.take_requests().is_empty());
@@ -1069,7 +1114,7 @@ async fn store_sync_and_rebuild_pass_through() {
             json!({"applied": 4, "frontier": "f-4", "complete": false}),
         ),
     ]);
-    let store = client.store("crm.accounts");
+    let store = crm(&client).store("accounts").unwrap();
     let sync = store.sync().await.unwrap();
     assert!(sync.complete);
     let rebuild = store.rebuild(Some(Uuid::nil())).await.unwrap();
@@ -1685,18 +1730,20 @@ async fn pipelined_fetch_returns_pages_in_order_and_stops_on_error() {
         "test-key",
     )
     .unwrap();
-    let mut stream = client.temporary_fetch_frames_pipelined(
-        "orders.events",
-        TemporaryFetch {
-            after: None,
-            limit: 10,
-            new_only: false,
-            tail: false,
-            wait_ms: None,
-            after_event_time_ns: None,
-        },
-        1,
-    );
+    let mut stream = orders(&client)
+        .temporary_fetch_frames_pipelined(
+            "events",
+            TemporaryFetch {
+                after: None,
+                limit: 10,
+                new_only: false,
+                tail: false,
+                wait_ms: None,
+                after_event_time_ns: None,
+            },
+            1,
+        )
+        .unwrap();
     let page1 = stream.next().await.unwrap().unwrap();
     assert_eq!(page1.records.len(), 1);
     assert_eq!(page1.next_cursor.as_deref(), Some("n1"));
@@ -1723,18 +1770,20 @@ async fn pipelined_fetch_returns_pages_in_order_and_stops_on_error() {
         "test-key",
     )
     .unwrap();
-    let mut stream = client.temporary_fetch_frames_pipelined(
-        "orders.events",
-        TemporaryFetch {
-            after: None,
-            limit: 10,
-            new_only: false,
-            tail: false,
-            wait_ms: None,
-            after_event_time_ns: None,
-        },
-        1,
-    );
+    let mut stream = orders(&client)
+        .temporary_fetch_frames_pipelined(
+            "events",
+            TemporaryFetch {
+                after: None,
+                limit: 10,
+                new_only: false,
+                tail: false,
+                wait_ms: None,
+                after_event_time_ns: None,
+            },
+            1,
+        )
+        .unwrap();
     assert!(stream.next().await.unwrap().is_ok());
     assert!(matches!(
         stream.next().await.unwrap(),

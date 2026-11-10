@@ -108,13 +108,12 @@ The first catalog accessor materializes one batched control read —
 | `subscriptions()` / `pipes()` / `indexes()` / `state_stores()` | scoped resources |
 
 `domain.create_feed("orders")` issues `CREATE FEED shop.orders` —
-the scoped companion of `client.wcl("CREATE FEED shop.orders")`.
-`domain.feed("orders")` and `domain.feed_with(..)` are pure name
-composition — they never hit the network, and a name outside the Domain
-grammar is refused locally. `client.create_reader(&domain, &feed)` and
-`client.create_writer(&domain, &feed)` refuse a feed from another
-Domain before any wire call; `create_reader_named`/`create_writer_named`
-take relative names directly.
+the scoped companion of `wcl("CREATE FEED shop.orders")`. The Domain is
+the only front door: Feeds, Writers, Readers, Subscriptions, Pipes,
+StateStores, and Indexes are always declared inside one —
+`domain.create_reader("orders")` / `domain.create_writer("orders")`
+take relative names or a `Feed` handle and refuse a feed from another
+Domain before any wire call.
 
 Reader identity is durable — like Kafka's `groupId`: acknowledged
 progress survives restarts under the same `reader_id`.
@@ -133,15 +132,15 @@ client.set_domain_schema("shop", &FeedSchema {
     value: Some(SchemaDecl { format: "json".into(), subject: Some("order-v1".into()), definition: None }),
     ..FeedSchema::default()
 }).await?;
-client.set_feed_schema("shop.orders", &FeedSchema {
+shop.set_feed_schema("orders", &FeedSchema {
     key: Some(SchemaDecl { format: "text".into(), subject: None, definition: None }),
     ..FeedSchema::default()
 }).await?;
 
 shop.schema().await?;                      // the Domain default
-shop.feed_schema("shop.orders").await?;    // effective: key=text, value=json/order-v1
-shop.declared_feed_schema("shop.orders").await?;
-client.clear_feed_schema("shop.orders").await?;  // reverts to inheritance
+shop.feed_schema("orders").await?;         // effective: key=text, value=json/order-v1
+shop.declared_feed_schema("orders").await?;
+shop.clear_feed_schema("orders").await?;   // reverts to inheritance
 ```
 
 `SET SCHEMA ON DOMAIN|FEED <name> (KEY|VALUE <format> [SUBJECT 'x']
@@ -161,14 +160,14 @@ every operation uses it. Built-ins:
 | `Codec::<T>::json()` | `T: Serialize + DeserializeOwned` | JSON text |
 | `Codec::custom(name, enc, dec)` | any | protobuf, Avro, MessagePack, framing, … |
 
-`client.feed(name)` and `client.store(name)` bind the cross-SDK
+`domain.feed(name)` and `domain.store(name)` bind the cross-SDK
 defaults (utf8 keys, raw byte payloads). `feed_with`/`store_with` bind
 explicit codecs; `feed.view(kc, vc)`/`store.view(kc, vc)` rebind without
 a wire call. Codec failures surface as `SdkError::Codec` — typed and
 non-retryable, since an unserializable value is never ambiguous
 server-side.
 
-The byte-level `client.writer`/`reader`/`state_store`/`records` surface
+The byte-level `domain.writer`/`reader`/`state_store`/`records` surface
 remains the explicit escape hatch and carries the full wire contract —
 nanosecond timestamps as `i64`, opaque cursors, record Metadata as raw
 bytes.
@@ -232,18 +231,18 @@ contract.
 | Area | API |
 |---|---|
 | Client & transport | `Client::http(endpoints, api_key)` `Client::new` · `use_compression` `with_api_key` `wire` · `health` `check_compatible` `transport_limits` |
-| Typed Domains | `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` · `create_feed` `create_reader` `create_writer` (relative) |
-| Schemas | `set_domain_schema` `set_feed_schema` `clear_domain_schema` `clear_feed_schema` · `Domain::schema` `feed_schema` `declared_feed_schema` · `SchemaDecl`/`FeedSchema` — `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`, `custom.<name>` |
-| Feeds | `feed(name)` / `feed_with(name, Codec, Codec)` → `Feed<K,V>` · `use_compression` · `records` `fetch` `load` · `writer` `append` `reader` `consumer` `subscribe` `view` |
+| Typed Domains | `create_domain(name)` declare+handle · `domain(name)` lazy / `get_domain(name)` eager · `name` `domain_id` `describe` `refresh` · `feeds` `feeds_prefixed` `feed_names` `readers` `writers` `subscriptions` `pipes` `indexes` `state_stores` · `feed` `feed_with` `get_feed` `create_feed` `create_reader` `create_writer` · `subscription` `create_subscription` `member` · `writer` `reader` `records` `temporary_fetch*` · `store` `store_with` `state_store` `state_store_raw` `define_state_store` `drop_state_store` · `pipe` `pipe_infos` `define_forward_pipe` `define_enrich_pipe` `define_window_pipe` · `query_index` `set_feed_schema` `clear_feed_schema` — the only front door for resources |
+| Schemas | `set_domain_schema` `clear_domain_schema` · `domain.set_feed_schema` `clear_feed_schema` · `Domain::schema` `feed_schema` `declared_feed_schema` · `SchemaDecl`/`FeedSchema` — `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`, `custom.<name>` |
+| Feeds | `domain.feed(name)` / `feed_with(name, Codec, Codec)` → `Feed<K,V>` · `use_compression` · `records` `fetch` `load` · `writer` `append` `reader` `consumer` `subscribe` `view` |
 | Writing | `FeedWriter::append` `append_event` `append_batch` · `reopen` `session_epoch` · idempotent `request_id` · `FeedEvent` carries event time + Metadata |
 | Reading | `FeedReader::for_each` pump · `fetch` `ack` `close` · `session_epoch` `acknowledged_cursor` · durable `reader_id` · `ReaderStart` — `Beginning`, `Now`, `Cursor`, `TimestampNs` |
-| Temporary fetches | `client.temporary_fetch` / `Feed::fetch` — `after_event_time_ns` seeks, `new_only`, `tail` + `wait_ms` long-poll · `Feed::records` `Feed::load` |
+| Temporary fetches | `domain.temporary_fetch` / `Feed::fetch` — `after_event_time_ns` seeks, `new_only`, `tail` + `wait_ms` long-poll · `Feed::records` `Feed::load` |
 | Consumers | `feed.consumer(reader)` → `FeedConsumer`/`ConsumerHandle`: `start_at` `capacity` `backoff` `on_error` `handle` `next` `run` `stop` `wait` `close` |
-| Subscription members | `client.create_subscription(name, feed, start)` · `client.member(subscription)` → `Member`: `member_id` `member_epoch` `claim` `fetch` `ack` `renew` `release` — shared progress + RF3 work leases · `Feed::subscribe` managed loop |
+| Subscription members | `domain.create_subscription(name, feed, start)` — the source Feed may cross Domains via `Scoped::abs`/a `Feed` handle · `domain.member(subscription)` → `Member`: `member_id` `member_epoch` `claim` `fetch` `ack` `renew` `release` — shared progress + RF3 work leases · `Feed::subscribe` managed loop |
 | StateStores | typed `store`/`store_with` → `Store<K,V>`: `put` `put_named` `get` `get_by` `find` `find_by` `get_or_default` `delete` `clear` `iterate` `sync` `rebuild` `view` `raw` · byte-level `state_store`/`state_store_raw` → `StateStore`: `put_row` `delete_row` `clear` `lookup` `get_by` `iterate` `sync` `rebuild` |
-| Indexes | `client.query_index(name, IndexQuery)` → `IndexPage` · `IndexBound` `IndexQuery` `TypedValue` |
-| Pipes | `define_forward_pipe` `define_enrich_pipe` `define_window_pipe` — `PipeOperation`/`WindowOperation`/`WindowAggregation`/`Extractor`/`EnrichFreshness`/`EnrichMiss`/`WindowTime` · durations are `std::time::Duration` · `client.pipe(name)` → `describe` `pause` `resume` `drop` · `client.pipes()` (`PipeInfo`) |
-| StateStore declare | `define_state_store(StateStoreSpec, source)` — `add_key` named keys (unique, `Extractor` on feed-sourced) · `MAX_NAMED_KEYS` |
+| Indexes | `domain.query_index(name, IndexQuery)` → `IndexPage` · `IndexBound` `IndexQuery` `TypedValue` |
+| Pipes | `domain.define_forward_pipe` `define_enrich_pipe` `define_window_pipe` — every endpoint a `Scoped` (`Scoped::rel`/`Scoped::abs`/`Feed`/`Store`/`StateStore`/`SubscriptionRef` handles); Pipe + input Subscription stay in-domain · `domain.pipe(name)` → `describe` `pause` `resume` `drop` · `domain.pipe_infos()` (`PipeInfo`) |
+| StateStore declare | `domain.define_state_store(StateStoreSpec, source)` — `add_key` named keys (unique, `Extractor` on feed-sourced) · `MAX_NAMED_KEYS` |
 | Observability | `demand_feeds` `demand_readers` `demand_subscriptions` `demand_indexes` `demand_pipes` → `DemandReport`/`DemandRow::counter` · `hot_keys` → `HotKey` (`feed` `share_bps` `window_records` `window_bytes`) |
 | Escape hatches | `wcl(script)` · `commands(Vec<Value>)` raw command batch · `Writer`/`Reader`/`Member`/`StateStore` byte-level sessions |
 | Errors | `SdkError` — `Refused` `StaleEpoch` `Sequence` `LeaseBusy` `LeaseStale` `LeaseCapacity` `Conflict` `Ambiguous` `Unavailable` `IndexBehind` `IncompatibleServer` |

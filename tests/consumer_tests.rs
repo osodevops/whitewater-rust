@@ -191,7 +191,11 @@ async fn next_delivers_each_record_and_acks_the_page() {
         Some("c2"),
         vec![record(b"k1", b"alpha", "c1"), record(b"k2", b"beta", "c2")],
     ));
-    let feed = client.feed("users.update.request");
+    let feed = client
+        .domain("users")
+        .unwrap()
+        .feed("update.request")
+        .unwrap();
     let mut consumer = feed
         .consumer("enricher")
         .backoff(Duration::from_millis(10), Duration::from_millis(50));
@@ -226,7 +230,11 @@ async fn run_handler_failure_skips_ack_and_redelivers() {
         .lock()
         .unwrap()
         .push_back(page(Some("c1"), vec![record(b"k1", b"alpha", "c1")]));
-    let feed = client.feed("users.update.request");
+    let feed = client
+        .domain("users")
+        .unwrap()
+        .feed("update.request")
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(Mutex::new(Vec::<SdkError>::new()));
     let errors_sink = errors.clone();
@@ -273,7 +281,11 @@ async fn stale_session_reopens_and_resumes() {
         .lock()
         .unwrap()
         .push_back(page(Some("c1"), vec![record(b"k1", b"alpha", "c1")]));
-    let feed = client.feed("users.update.request");
+    let feed = client
+        .domain("users")
+        .unwrap()
+        .feed("update.request")
+        .unwrap();
     let mut consumer = feed
         .consumer("enricher")
         .backoff(Duration::from_millis(10), Duration::from_millis(50));
@@ -299,7 +311,11 @@ async fn stale_session_reopens_and_resumes() {
 async fn startup_refusal_fails_fast() {
     let (client, stub) = client();
     *stub.wcl.lock().unwrap() = (400, json!({"error": "denied", "code": "refused"}));
-    let feed = client.feed("users.update.request");
+    let feed = client
+        .domain("users")
+        .unwrap()
+        .feed("update.request")
+        .unwrap();
     let mut consumer = feed.consumer("enricher");
 
     let error = consumer
@@ -314,7 +330,11 @@ async fn startup_refusal_fails_fast() {
 async fn invalid_reader_name_fails_fast_not_loops() {
     let (client, stub) = client();
     *stub.wcl.lock().unwrap() = (400, json!({"error": "bad name", "code": "refused"}));
-    let feed = client.feed("users.update.request");
+    let feed = client
+        .domain("users")
+        .unwrap()
+        .feed("update.request")
+        .unwrap();
     let mut consumer = feed.consumer("Bad Name!");
 
     let result = consumer.run(|_| async { Ok(()) }).await;
@@ -357,7 +377,11 @@ async fn store_find_find_by_and_get_or_default() {
         .unwrap()
         .insert("/v1/state-stores/get-by".to_owned(), rows("alice"));
 
-    let profiles = client.store_with("users.profiles", Codec::utf8(), Codec::utf8());
+    let profiles = client
+        .domain("users")
+        .unwrap()
+        .store_with("profiles", Codec::utf8(), Codec::utf8())
+        .unwrap();
     assert_eq!(
         profiles.find(&"a@x.io".to_owned()).await.expect("find"),
         Some("alice".to_owned())

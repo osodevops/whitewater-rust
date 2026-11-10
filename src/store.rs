@@ -35,10 +35,11 @@ pub struct NamedKey {
 /// ```no_run
 /// # use whitewater::{Client, StateStoreSpec, Extractor};
 /// # async fn example(client: &Client) -> Result<(), whitewater::SdkError> {
-/// let spec = StateStoreSpec::new("accounts.employees")?
+/// let accounts = client.domain("accounts")?;
+/// let spec = StateStoreSpec::new("employees")?     // -> accounts.employees
 ///     .add_key("passport", true, None)?
 ///     .add_key("department", false, None)?;
-/// let store = client.define_state_store(spec, None).await?;
+/// let store = accounts.define_state_store(spec, None).await?;
 /// # Ok(())
 /// # }
 /// ```
