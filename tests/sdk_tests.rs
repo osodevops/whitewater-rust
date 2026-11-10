@@ -1624,7 +1624,11 @@ impl Transport for PageStubTransport {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Err(SdkError::Transport("no scripted page".to_owned())))
-            .map(|(status, body)| TransportBytesReply { status, body })
+            .map(|(status, body)| TransportBytesReply {
+                status,
+                body,
+                headers: Vec::new(),
+            })
     }
 }
 

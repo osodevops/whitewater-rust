@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::codec::Codec;
+use crate::consumer::ReaderStart;
 use crate::domain::{Domain, FeedSchema, ReaderBuilder, WriterBuilder};
 use crate::error::{map_error, SdkError};
 use crate::feed::Feed;
@@ -15,10 +16,13 @@ use crate::member::Member;
 use crate::model::{
     decode_record, urlencode, Record, TemporaryFetch, TemporaryPage, TransportLimits,
 };
+use crate::operations::{EnrichMiss, PipeOperation};
 use crate::pipe::{decode_pipes, Pipe, PipeInfo};
 use crate::reader::Reader;
-use crate::store::StateStore;
-use crate::transport::{HttpTransport, Transport, TransportReply};
+use crate::store::{StateStore, StateStoreSpec};
+use crate::transport::{
+    HttpTransport, Transport, TransportFramePageReply, TransportMetaFramePageReply, TransportReply,
+};
 use crate::typed::{decode_index_page, wire_typed, IndexPage, IndexQuery};
 use crate::typed_store::Store;
 use crate::writer::Writer;
@@ -167,6 +171,67 @@ impl Client {
             Err(SdkError::Transport(_)) => {
                 let fallback = self.base().to_owned();
                 let result = self.call_on(&fallback, method, path, body).await;
+                if result.is_ok() {
+                    *pinned.lock().expect("pinned base") = fallback;
+                }
+                result
+            }
+            other => other,
+        }
+    }
+
+    /// Frame-page variant of [`Client::session_call`] — same
+    /// pin-then-failover contract, but the reply is the decoded binary
+    /// page plus its response headers (reader pacing advice rides
+    /// `x-whitewater-*` headers on the binary wire).
+    pub(crate) async fn session_call_frame_page(
+        &self,
+        pinned: &std::sync::Arc<std::sync::Mutex<String>>,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<TransportFramePageReply, SdkError> {
+        let base = pinned.lock().expect("pinned base").clone();
+        match self
+            .transport
+            .request_frame_page(&base, path, body, &self.api_key, None)
+            .await
+        {
+            Err(SdkError::Transport(_)) => {
+                let fallback = self.base().to_owned();
+                let result = self
+                    .transport
+                    .request_frame_page(&fallback, path, body, &self.api_key, None)
+                    .await;
+                if result.is_ok() {
+                    *pinned.lock().expect("pinned base") = fallback;
+                }
+                result
+            }
+            other => other,
+        }
+    }
+
+    /// Meta-frame-page variant of [`Client::session_call`] for
+    /// `members/fetch` — the `u32 meta_len` + JSON prelude + frame page
+    /// wire, pinned like every session call.
+    pub(crate) async fn session_call_meta_frame_page(
+        &self,
+        pinned: &std::sync::Arc<std::sync::Mutex<String>>,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<TransportMetaFramePageReply, SdkError> {
+        let base = pinned.lock().expect("pinned base").clone();
+        match self
+            .transport
+            .request_meta_frame_page(&base, path, body, &self.api_key)
+            .await
+        {
+            Err(SdkError::Transport(_)) => {
+                let fallback = self.base().to_owned();
+                let result = self
+                    .transport
+                    .request_meta_frame_page(&fallback, path, body, &self.api_key)
+                    .await;
                 if result.is_ok() {
                     *pinned.lock().expect("pinned base") = fallback;
                 }
@@ -423,6 +488,25 @@ impl Client {
         })
     }
 
+    /// `CREATE SUBSCRIPTION <name> FROM <feed> [START AT <start>]` —
+    /// the durable shared-progress lease `Member`s cooperate through.
+    /// `start` defaults to [`ReaderStart::Beginning`]; `Now`,
+    /// `Cursor`, and `TimestampNs` select other starts. Names pass
+    /// through verbatim — the server enforces the dotted-name grammar.
+    pub async fn create_subscription(
+        &self,
+        name: &str,
+        feed: &str,
+        start: Option<ReaderStart>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let start = start.unwrap_or(ReaderStart::Beginning);
+        self.wcl(&format!(
+            "CREATE SUBSCRIPTION {name} FROM {feed} START AT {};",
+            start.wcl()
+        ))
+        .await
+    }
+
     /// Join a Subscription as a cooperating member.
     pub async fn member(&self, subscription: &str) -> Result<Member, SdkError> {
         let base = self.base().to_owned();
@@ -451,7 +535,10 @@ impl Client {
     }
 
     /// Read a page straight off a Feed: `after` resumes from an opaque
-    /// Cursor, `limit` bounds the page.
+    /// Cursor, `limit` bounds the page. Requests the binary frame page
+    /// first — a bulk history walk never pays the server-side base64 +
+    /// JSON pass — and transparently reads the JSON shape when the
+    /// serving Node or scripted transport does not speak frames.
     pub async fn records(
         &self,
         feed: &str,
@@ -462,6 +549,11 @@ impl Client {
         if let Some(cursor) = after {
             path.push_str(&format!("&after={}", urlencode(cursor)));
         }
+        match self.records_frames(&path).await {
+            Ok(records) => return Ok(records),
+            Err(SdkError::Refused(_)) => {}
+            Err(error) => return Err(error),
+        }
         let body = self.call("GET", &path, None).await?;
         let records = body
             .as_array()
@@ -469,6 +561,40 @@ impl Client {
             .or_else(|| body.get("records").and_then(Value::as_array).cloned())
             .unwrap_or_default();
         records.iter().map(decode_record).collect()
+    }
+
+    /// The binary arm of [`Client::records`]: rotates the endpoint pool
+    /// like every stateless call and decodes either the frame page or
+    /// the JSON body a frames-unaware Node answered with.
+    async fn records_frames(&self, path: &str) -> Result<Vec<Record>, SdkError> {
+        let mut last = SdkError::Transport("no Node attempted".to_owned());
+        for _ in 0..self.bases.len() {
+            let base = self.base().to_owned();
+            match self
+                .transport
+                .request_frame_page_get(&base, path, &self.api_key)
+                .await
+            {
+                Ok(reply) if (200..300).contains(&reply.status) => {
+                    if let Some((records, _)) = reply.page {
+                        return Ok(records);
+                    }
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+                    let records = body
+                        .as_array()
+                        .cloned()
+                        .or_else(|| body.get("records").and_then(Value::as_array).cloned())
+                        .unwrap_or_default();
+                    return records.iter().map(decode_record).collect();
+                }
+                Ok(reply) => {
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+                    return Err(map_error(reply.status, &body));
+                }
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
     }
 
     /// Bind a declared StateStore handle — no call; operations resolve
@@ -684,6 +810,168 @@ impl Client {
         feed: &str,
     ) -> Result<WriterBuilder<String, String>, SdkError> {
         self.create_writer(domain, &domain.feed(feed)?)
+    }
+
+    /// `DEFINE PIPE` for a forward (copy) Pipe: each record the
+    /// Subscription delivers lands unchanged on `output_feed`. Names
+    /// pass through verbatim — the server enforces the dotted-name
+    /// grammar and returns the catalog row as a [`PipeInfo`]-shaped
+    /// result entry.
+    pub async fn define_forward_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_feed: &str,
+    ) -> Result<Vec<Value>, SdkError> {
+        self.commands(vec![json!({
+            "command": "define_pipe",
+            "name": name,
+            "subscription": subscription,
+            "output_feed": output_feed,
+            "operation": PipeOperation::forward().to_wire(),
+        })])
+        .await
+    }
+
+    /// `DEFINE PIPE` for an enrich Pipe: each record the Subscription
+    /// delivers resolves one `output_store` row through the operation's
+    /// `key` and lands on `output_feed` with the journaled lookup
+    /// result. `operation` must come from [`PipeOperation::enrich`] —
+    /// a mismatched step refuses locally. `quarantine_feed` names the
+    /// miss-quarantine target and is valid only when the operation's
+    /// `on_miss` is [`EnrichMiss::Quarantine`]; that combination is
+    /// also required — a quarantine miss without a feed refuses locally.
+    pub async fn define_enrich_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_feed: &str,
+        output_store: &str,
+        operation: impl Into<PipeOperation>,
+        quarantine_feed: Option<&str>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let operation = operation.into();
+        let PipeOperation::Enrich { key, on_miss, .. } = &operation else {
+            return Err(SdkError::Refused(
+                "enrich pipes take PipeOperation::enrich(...)".to_owned(),
+            ));
+        };
+        key.validate()?;
+        match (on_miss, quarantine_feed) {
+            (EnrichMiss::Quarantine, None) => {
+                return Err(SdkError::Refused(
+                    "on_miss quarantine requires a quarantine_feed".to_owned(),
+                ));
+            }
+            (_, Some(_)) if *on_miss != EnrichMiss::Quarantine => {
+                return Err(SdkError::Refused(
+                    "a quarantine_feed is only valid with on_miss quarantine".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let mut command = json!({
+            "command": "define_pipe",
+            "name": name,
+            "subscription": subscription,
+            "output_feed": output_feed,
+            "output_store": output_store,
+            "operation": operation.to_wire(),
+        });
+        if let Some(feed) = quarantine_feed {
+            command["quarantine_feed"] = json!(feed);
+        }
+        self.commands(vec![command]).await
+    }
+
+    /// `DEFINE PIPE` for a window Pipe: each record the Subscription
+    /// delivers accumulates into `window_ns`-wide panes of the
+    /// `output_store` view (which must declare non-unique named keys
+    /// `key` and `pane`). `operation` must come from
+    /// [`PipeOperation::window`] — a mismatched step refuses locally,
+    /// as do the lateness/retention bound combinations the server
+    /// rejects. `emit_feed` publishes closed panes and requires the
+    /// operation to declare `max_late_ns` or `watermark_ns` — without a
+    /// lateness bound no pane ever provably closes.
+    pub async fn define_window_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_store: &str,
+        operation: impl Into<PipeOperation>,
+        emit_feed: Option<&str>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let operation = operation.into();
+        let PipeOperation::Window(window) = &operation else {
+            return Err(SdkError::Refused(
+                "window pipes take PipeOperation::window(...)".to_owned(),
+            ));
+        };
+        window.validate(emit_feed.is_some())?;
+        let mut command = json!({
+            "command": "define_pipe",
+            "name": name,
+            "subscription": subscription,
+            "output_store": output_store,
+            "operation": operation.to_wire(),
+        });
+        if let Some(feed) = emit_feed {
+            command["emit_feed"] = json!(feed);
+        }
+        self.commands(vec![command]).await
+    }
+
+    /// `DEFINE STATESTORE`: declare `spec` on the Control Plane and
+    /// return it bound to this client. `source` names a same-Domain Feed
+    /// the store materializes from; `None` means a manual store.
+    /// Feed-sourced named keys must each declare an `extractor` so
+    /// replay can project typed values; extractors on a manual store
+    /// are refused.
+    pub async fn define_state_store(
+        &self,
+        spec: StateStoreSpec,
+        source: Option<&str>,
+    ) -> Result<StateStore, SdkError> {
+        if source.is_none() && spec.named_keys().iter().any(|key| key.extractor.is_some()) {
+            return Err(SdkError::Refused(
+                "named-key extractors apply to feed-sourced StateStores; \
+                 manual stores take named values on each put_row mutation"
+                    .to_owned(),
+            ));
+        }
+        if source.is_some() && spec.named_keys().iter().any(|key| key.extractor.is_none()) {
+            return Err(SdkError::Refused(
+                "feed-sourced named keys require an extractor \
+                 (Extractor::record_key()/metadata()/json())"
+                    .to_owned(),
+            ));
+        }
+        for key in spec.named_keys() {
+            if let Some(extractor) = &key.extractor {
+                extractor.validate()?;
+            }
+        }
+        self.commands(vec![json!({
+            "command": "define_state_store",
+            "name": spec.name(),
+            "source": match source {
+                Some(feed) => json!({ "kind": "feed", "feed": feed }),
+                None => json!({ "kind": "manual" }),
+            },
+            "named_keys": spec
+                .named_keys()
+                .iter()
+                .map(|key| {
+                    let mut entry = json!({ "name": key.name, "unique": key.unique });
+                    if let Some(extractor) = &key.extractor {
+                        entry["extractor"] = extractor.to_wire();
+                    }
+                    entry
+                })
+                .collect::<Vec<_>>(),
+        })])
+        .await?;
+        Ok(self.state_store(spec.name()))
     }
 
     /// `SHOW PIPES` decoded as [`PipeInfo`] rows.

@@ -11,9 +11,10 @@ boundary, and Cursors are opaque.
 - **Session-bound writers and readers** — epoch-fenced appends with
   caller-pinned `request_id` idempotency; delivered-cursor acks.
 - **Subscription members** — join, claim, fetch, ack, renew, release.
-- **Indexes, Pipes, StateStores** — typed index queries, Pipe
-  describe/pause/resume/drop, manual and feed-sourced stores with
-  freshness evidence.
+- **Indexes, Pipes, StateStores** — typed index queries, forward/enrich/
+  window Pipe defines plus describe/pause/resume/drop lifecycle, manual
+  and feed-sourced stores with named-key extractors and freshness
+  evidence.
 - **Demand observability** — per-resource counters and per-domain
   rollups (`demand_feeds`, `demand_readers`, `demand_subscriptions`,
   `demand_indexes`, `demand_pipes`, `hot_keys`).
@@ -238,10 +239,11 @@ contract.
 | Reading | `FeedReader::for_each` pump · `fetch` `ack` `close` · `session_epoch` `acknowledged_cursor` · durable `reader_id` · `ReaderStart` — `Beginning`, `Now`, `Cursor`, `TimestampNs` |
 | Temporary fetches | `client.temporary_fetch` / `Feed::fetch` — `after_event_time_ns` seeks, `new_only`, `tail` + `wait_ms` long-poll · `Feed::records` `Feed::load` |
 | Consumers | `feed.consumer(reader)` → `FeedConsumer`/`ConsumerHandle`: `start_at` `capacity` `backoff` `on_error` `handle` `next` `run` `stop` `wait` `close` |
-| Subscription members | `client.member(subscription)` → `Member`: `member_id` `member_epoch` `claim` `fetch` `ack` `renew` `release` — shared progress + RF3 work leases · `Feed::subscribe` managed loop |
+| Subscription members | `client.create_subscription(name, feed, start)` · `client.member(subscription)` → `Member`: `member_id` `member_epoch` `claim` `fetch` `ack` `renew` `release` — shared progress + RF3 work leases · `Feed::subscribe` managed loop |
 | StateStores | typed `store`/`store_with` → `Store<K,V>`: `put` `put_named` `get` `get_by` `find` `find_by` `get_or_default` `delete` `clear` `iterate` `sync` `rebuild` `view` `raw` · byte-level `state_store`/`state_store_raw` → `StateStore`: `put_row` `delete_row` `clear` `lookup` `get_by` `iterate` `sync` `rebuild` |
 | Indexes | `client.query_index(name, IndexQuery)` → `IndexPage` · `IndexBound` `IndexQuery` `TypedValue` |
-| Pipes | `client.pipe(name)` → `describe` `pause` `resume` `drop` · `client.pipes()` · declared via `commands` (`PipeInfo`) · durations are `std::time::Duration` |
+| Pipes | `define_forward_pipe` `define_enrich_pipe` `define_window_pipe` — `PipeOperation`/`WindowOperation`/`WindowAggregation`/`Extractor`/`EnrichFreshness`/`EnrichMiss`/`WindowTime` · durations are `std::time::Duration` · `client.pipe(name)` → `describe` `pause` `resume` `drop` · `client.pipes()` (`PipeInfo`) |
+| StateStore declare | `define_state_store(StateStoreSpec, source)` — `add_key` named keys (unique, `Extractor` on feed-sourced) · `MAX_NAMED_KEYS` |
 | Observability | `demand_feeds` `demand_readers` `demand_subscriptions` `demand_indexes` `demand_pipes` → `DemandReport`/`DemandRow::counter` · `hot_keys` → `HotKey` (`feed` `share_bps` `window_records` `window_bytes`) |
 | Escape hatches | `wcl(script)` · `commands(Vec<Value>)` raw command batch · `Writer`/`Reader`/`Member`/`StateStore` byte-level sessions |
 | Errors | `SdkError` — `Refused` `StaleEpoch` `Sequence` `LeaseBusy` `LeaseStale` `LeaseCapacity` `Conflict` `Ambiguous` `Unavailable` `IndexBehind` `IncompatibleServer` |
@@ -280,9 +282,10 @@ src/
   writer.rs       session-bound Writer
   reader.rs       session-bound Reader
   member.rs       Subscription member (claim/fetch/ack/renew/release)
-  store.rs        byte-level StateStore + freshness/outcome types
+  store.rs        byte-level StateStore + freshness/outcome types + StateStoreSpec
   pipe.rs         declared Pipe lifecycle
-  typed.rs        TypedValue + IndexQuery/IndexPage
+  operations.rs   PipeOperation / WindowOperation / WindowAggregation wire shapes
+  typed.rs        TypedValue + IndexQuery/IndexPage + Extractor
   demand.rs       demand counters + hot-Key evidence
   codec.rs        Codec<T> — utf8 / bytes / json / custom
   feed.rs         Feed<K,V>, FeedWriter, FeedReader, subscribe

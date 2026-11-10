@@ -51,6 +51,7 @@ mod feed;
 mod frame;
 mod member;
 mod model;
+mod operations;
 mod pipe;
 mod reader;
 mod store;
@@ -71,13 +72,20 @@ pub use feed::{
 };
 pub use member::{ClaimedWork, Member, WorkPage};
 pub use model::{AppendOutcome, FetchPage, Record, TemporaryFetch, TemporaryPage, TransportLimits};
+pub use operations::{
+    EnrichFreshness, EnrichMiss, PipeOperation, WindowAggregation, WindowOperation, WindowTime,
+    WINDOW_MAX_BYTE_LIMIT, WINDOW_MAX_KEY_LIMIT,
+};
 pub use pipe::{Pipe, PipeInfo};
 pub use reader::{AutoReader, Reader};
 pub use store::{
-    GetByPage, IteratePage, LookupOutcome, MutationOutcome, ReadFreshness, StateStore, StoreRow,
-    SyncOutcome,
+    GetByPage, IteratePage, LookupOutcome, MutationOutcome, NamedKey, ReadFreshness, StateStore,
+    StateStoreSpec, StoreRow, SyncOutcome, MAX_NAMED_KEYS,
 };
-pub use transport::{HttpTransport, Transport, TransportBytesReply, TransportReply};
-pub use typed::{IndexBound, IndexPage, IndexQuery, TypedValue};
+pub use transport::{
+    HttpTransport, Transport, TransportBytesReply, TransportFramePageReply,
+    TransportMetaFramePageReply, TransportReply,
+};
+pub use typed::{Extractor, IndexBound, IndexPage, IndexQuery, TypedValue};
 pub use typed_store::{IterateRows, Lookup, Row, RowPage, Store};
 pub use writer::{AppendItem, PumpedWriter, Writer};

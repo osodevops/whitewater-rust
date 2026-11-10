@@ -112,49 +112,62 @@ impl Member {
 
     /// Fetch the bounded page of records bound to a claimed work item.
     /// The returned `cursor`/`positions` are the ack evidence — commit
-    /// them with `Member::ack` after processing the page.
+    /// them with `Member::ack` after processing the page. Requests the
+    /// `member-frames` wire — `u32 meta_len` + metadata JSON + frame
+    /// page — so a member drain never pays the server-side decode +
+    /// base64 + JSON pass; Nodes or scripted transports that do not
+    /// speak it get the ordinary JSON call.
     pub async fn fetch(&self, work: &ClaimedWork, limit: u64) -> Result<WorkPage, SdkError> {
+        let payload = json!({
+            "subscription": self.subscription,
+            "request_id": Uuid::new_v4().to_string(),
+            "member_id": self.member_id.to_string(),
+            "member_epoch": self.member_epoch,
+            "work_id": work.work_id.to_string(),
+            "lease_epoch": work.lease_epoch,
+            "limit": limit,
+        });
+        match self
+            .client
+            .session_call_meta_frame_page(
+                &self.pinned,
+                "/v1/subscriptions/members/fetch",
+                Some(&payload),
+            )
+            .await
+        {
+            Ok(reply) if (200..300).contains(&reply.status) => {
+                return match (reply.page, reply.meta) {
+                    // Binary page: `next_cursor` carried the fetch
+                    // `cursor`; the rest came through the meta prelude.
+                    (Some((records, cursor)), Some(meta)) => Ok(work_page(records, cursor, &meta)),
+                    // The Node ignored the Accept — `meta` holds the
+                    // ordinary JSON response.
+                    (None, Some(meta)) => work_page_from_json(&meta),
+                    _ => Err(SdkError::Protocol(
+                        "member fetch reply carried neither page nor JSON".to_owned(),
+                    )),
+                };
+            }
+            Ok(reply) => {
+                let body: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+                return Err(crate::error::map_error(reply.status, &body));
+            }
+            // Scripted transports without meta-frame support fall
+            // through to the JSON call.
+            Err(SdkError::Refused(_)) => {}
+            Err(error) => return Err(error),
+        }
         let body = self
             .client
             .session_call(
                 &self.pinned,
                 "POST",
                 "/v1/subscriptions/members/fetch",
-                Some(&json!({
-                    "subscription": self.subscription,
-                    "request_id": Uuid::new_v4().to_string(),
-                    "member_id": self.member_id.to_string(),
-                    "member_epoch": self.member_epoch,
-                    "work_id": work.work_id.to_string(),
-                    "lease_epoch": work.lease_epoch,
-                    "limit": limit,
-                })),
+                Some(&payload),
             )
             .await?;
-        let records = body
-            .get("records")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(decode_record)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(WorkPage {
-            records,
-            cursor: body
-                .get("cursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            positions: body.get("positions").cloned().unwrap_or(Value::Null),
-            delivery_attempt: body
-                .get("delivery_attempt")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            next_delivery_ns: body
-                .get("next_delivery_ns")
-                .and_then(Value::as_str)
-                .and_then(|raw| raw.parse::<i64>().ok()),
-        })
+        work_page_from_json(&body)
     }
 
     /// Commit the claimed work's progress under the lease epoch, carrying
@@ -222,4 +235,43 @@ impl Member {
             .await?;
         Ok(())
     }
+}
+
+/// Assemble the `WorkPage` from already-decoded records plus the
+/// metadata fields — the binary arm's prelude and the JSON body carry
+/// the same names.
+fn work_page(records: Vec<Record>, cursor: Option<String>, meta: &Value) -> WorkPage {
+    WorkPage {
+        records,
+        cursor,
+        positions: meta.get("positions").cloned().unwrap_or(Value::Null),
+        delivery_attempt: meta
+            .get("delivery_attempt")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        next_delivery_ns: meta
+            .get("next_delivery_ns")
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<i64>().ok()),
+    }
+}
+
+/// The JSON response shape: `records` decode inline, `cursor` is its
+/// own field — the inverse of the meta-prelude split.
+fn work_page_from_json(body: &Value) -> Result<WorkPage, SdkError> {
+    let records = body
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(decode_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(work_page(
+        records,
+        body.get("cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        body,
+    ))
 }

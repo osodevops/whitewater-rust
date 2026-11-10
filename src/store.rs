@@ -8,7 +8,102 @@ use uuid::Uuid;
 use crate::client::Client;
 use crate::error::SdkError;
 use crate::model::STANDARD;
-use crate::typed::{wire_typed, TypedValue};
+use crate::typed::{wire_typed, Extractor, TypedValue};
+
+/// The most named secondary keys one StateStore may declare — the
+/// server enforces the same ceiling.
+pub const MAX_NAMED_KEYS: usize = 10;
+
+/// One declared secondary key on a StateStore. Non-unique keys map a
+/// value to every primary row carrying it (the group/list lookup);
+/// `unique` claims enforce one row per value, arbitrated
+/// first-committed-wins by the store's journal order. `extractor`
+/// projects values from a source-Feed record — feed-sourced stores only;
+/// manual stores take values on each `put_row` mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedKey {
+    pub name: String,
+    pub unique: bool,
+    pub extractor: Option<Extractor>,
+}
+
+/// The declaration `Client::define_state_store` commits: the store name
+/// plus its named keys. Build with [`StateStoreSpec::new`] and chain
+/// [`StateStoreSpec::add_key`] — named keys are declared at creation and
+/// cannot be added to an already-declared store.
+///
+/// ```no_run
+/// # use whitewater::{Client, StateStoreSpec, Extractor};
+/// # async fn example(client: &Client) -> Result<(), whitewater::SdkError> {
+/// let spec = StateStoreSpec::new("accounts.employees")?
+///     .add_key("passport", true, None)?
+///     .add_key("department", false, None)?;
+/// let store = client.define_state_store(spec, None).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct StateStoreSpec {
+    name: String,
+    named_keys: Vec<NamedKey>,
+}
+
+impl StateStoreSpec {
+    /// An unbound declaration spec for [`Client::define_state_store`].
+    pub fn new(name: impl Into<String>) -> Result<Self, SdkError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(SdkError::Refused("state store name is required".to_owned()));
+        }
+        Ok(Self {
+            name,
+            named_keys: Vec::new(),
+        })
+    }
+
+    /// Declare a named secondary key (at most [`MAX_NAMED_KEYS`]).
+    /// Non-unique keys map one value to every matching primary row;
+    /// `unique` enforces one row per value. An `extractor` declares how
+    /// replay projects each source-Feed record to this key's values —
+    /// required on feed-sourced stores, refused on manual ones.
+    pub fn add_key(
+        mut self,
+        named_key: impl Into<String>,
+        unique: bool,
+        extractor: Option<Extractor>,
+    ) -> Result<Self, SdkError> {
+        let named_key = named_key.into();
+        if named_key.trim().is_empty() {
+            return Err(SdkError::Refused("named key is required".to_owned()));
+        }
+        if self.named_keys.iter().any(|key| key.name == named_key) {
+            return Err(SdkError::Refused(format!(
+                "duplicate named key: {named_key}"
+            )));
+        }
+        if self.named_keys.len() >= MAX_NAMED_KEYS {
+            return Err(SdkError::Refused(format!(
+                "a StateStore declares at most {MAX_NAMED_KEYS} named keys"
+            )));
+        }
+        self.named_keys.push(NamedKey {
+            name: named_key,
+            unique,
+            extractor,
+        });
+        Ok(self)
+    }
+
+    /// The declared named keys in declaration order.
+    pub fn named_keys(&self) -> &[NamedKey] {
+        &self.named_keys
+    }
+
+    /// The store name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
 
 /// Outcome of one committed StateStore mutation.
 #[derive(Clone, Debug)]

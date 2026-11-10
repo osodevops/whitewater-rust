@@ -30,6 +30,77 @@ pub(crate) fn wire_typed(value: &TypedValue) -> Value {
     }
 }
 
+/// How a committed record projects to a typed field value — the
+/// `IndexFieldSpec` the wire carries. Declared on StateStore named keys
+/// (feed-sourced stores) and on Pipe enrich/window operations; applied
+/// by server-side replay and drive. Manual stores leave it unset and
+/// take values on each `put_row` instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Extractor {
+    /// The source record's application Key.
+    RecordKey,
+    /// A named record Metadata entry.
+    Metadata(String),
+    /// A JSON-path projection over the record payload.
+    Json(String),
+}
+
+impl Extractor {
+    /// The source record's application Key.
+    pub fn record_key() -> Self {
+        Self::RecordKey
+    }
+
+    /// A named record Metadata entry.
+    pub fn metadata(name: impl Into<String>) -> Result<Self, SdkError> {
+        let name = name.into();
+        if name.trim().is_empty() || name.len() > 256 {
+            return Err(SdkError::Refused(
+                "metadata extractor name must be 1..=256 bytes".to_owned(),
+            ));
+        }
+        Ok(Self::Metadata(name))
+    }
+
+    /// A `json` version-1 path projection over the record payload.
+    pub fn json(field: impl Into<String>) -> Result<Self, SdkError> {
+        let field = field.into();
+        if field.trim().is_empty() || field.len() > 512 {
+            return Err(SdkError::Refused(
+                "json extractor field must be 1..=512 bytes".to_owned(),
+            ));
+        }
+        Ok(Self::Json(field))
+    }
+
+    /// The wire `IndexFieldSpec` object the catalog stores.
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::RecordKey => json!({ "kind": "key" }),
+            Self::Metadata(name) => json!({ "kind": "metadata", "name": name }),
+            Self::Json(field) => json!({
+                "kind": "projection",
+                "extractor": "json",
+                "version": 1,
+                "field": field,
+            }),
+        }
+    }
+
+    /// The field-spec bounds the server enforces on declarations;
+    /// enum-literal construction re-checks here so a malformed spec
+    /// still fails before it reaches the wire.
+    pub(crate) fn validate(&self) -> Result<(), SdkError> {
+        let invalid = || SdkError::Refused(format!("invalid field spec {}", self.to_wire()));
+        match self {
+            Self::RecordKey => Ok(()),
+            Self::Metadata(name) if !name.is_empty() && name.len() <= 256 => Ok(()),
+            Self::Json(field) if !field.is_empty() && field.len() <= 512 => Ok(()),
+            _ => Err(invalid()),
+        }
+    }
+}
+
 /// Inclusive/exclusive bound for an Index range query.
 #[derive(Clone, Debug)]
 pub struct IndexBound {
