@@ -85,6 +85,30 @@ async fn main() -> Result<(), whitewater::SdkError> {
 }
 ```
 
+### Codecs
+
+`Codec<T>` is a bidirectional value contract — `encode`/`decode` once,
+every operation uses it. Built-ins:
+
+| Codec | Rust type | Wire bytes |
+|---|---|---|
+| `Codec::utf8()` | `String` | UTF-8 text |
+| `Codec::bytes()` | `Vec<u8>` | unchanged |
+| `Codec::<T>::json()` | `T: Serialize + DeserializeOwned` | JSON text |
+| `Codec::custom(name, enc, dec)` | any | protobuf, Avro, MessagePack, framing, … |
+
+`domain.feed(name)` and `domain.store(name)` bind the cross-SDK
+defaults (utf8 keys, raw byte payloads). `feed_with`/`store_with` bind
+explicit codecs; `feed.view(kc, vc)`/`store.view(kc, vc)` rebind without
+a wire call. Codec failures surface as `SdkError::Codec` — typed and
+non-retryable, since an unserializable value is never ambiguous
+server-side.
+
+The byte-level `domain.writer`/`reader`/`state_store`/`records` surface
+remains the explicit escape hatch and carries the full wire contract —
+nanosecond timestamps as `i64`, opaque cursors, record Metadata as raw
+bytes.
+
 ## Domains
 
 A `Domain` is the strongly-typed administrative namespace that owns
@@ -148,30 +172,6 @@ shop.clear_feed_schema("orders").await?;   // reverts to inheritance
 assignments. Formats today: `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`,
 or `custom.<name>` — compatibility enforcement is still a no-op.
 
-## Codecs
-
-`Codec<T>` is a bidirectional value contract — `encode`/`decode` once,
-every operation uses it. Built-ins:
-
-| Codec | Rust type | Wire bytes |
-|---|---|---|
-| `Codec::utf8()` | `String` | UTF-8 text |
-| `Codec::bytes()` | `Vec<u8>` | unchanged |
-| `Codec::<T>::json()` | `T: Serialize + DeserializeOwned` | JSON text |
-| `Codec::custom(name, enc, dec)` | any | protobuf, Avro, MessagePack, framing, … |
-
-`domain.feed(name)` and `domain.store(name)` bind the cross-SDK
-defaults (utf8 keys, raw byte payloads). `feed_with`/`store_with` bind
-explicit codecs; `feed.view(kc, vc)`/`store.view(kc, vc)` rebind without
-a wire call. Codec failures surface as `SdkError::Codec` — typed and
-non-retryable, since an unserializable value is never ambiguous
-server-side.
-
-The byte-level `domain.writer`/`reader`/`state_store`/`records` surface
-remains the explicit escape hatch and carries the full wire contract —
-nanosecond timestamps as `i64`, opaque cursors, record Metadata as raw
-bytes.
-
 ## Permanent consumer: `feed.consumer()` — supervision inside
 
 For the Kafka-style "consume forever" loop, `feed.consumer(reader)`
@@ -220,6 +220,24 @@ let profile = profiles.find(&email).await?
 let n = counters.get_or_default(&bucket, 0).await?;   // counters, one line
 ```
 
+### Error contract
+
+`SdkError` maps wire `(status, code)` to typed variants:
+`StaleEpoch` (reopen the session), `LeaseBusy`/`LeaseStale`/
+`LeaseCapacity` (subscription work fencing), `IndexBehind` (strict
+freshness unreachable in the bounded wait), `Unavailable`/`Ambiguous`/
+`Transport` (`retryable()` — retry the identical request), `Conflict`,
+`Refused`, `IncompatibleServer`, `Protocol`, `Codec`.
+
+## Observability
+
+`client.demand_feeds()` et al. return `DemandReport` — per-resource
+`DemandRow`s (name, domain, verbatim counter fields) plus the per-domain
+rollup. Counter names are a server-owned vocabulary; `row.counter("x")`
+reads any field. `client.hot_keys()` reports dominant-Key evidence — the
+operator signal to spread or shed load, since a strictly ordered hot Key
+is never parallelized.
+
 ## API surface
 
 Everything the SDK exposes, grouped by capability. The typed surface
@@ -247,24 +265,6 @@ contract.
 | Escape hatches | `wcl(script)` · `commands(Vec<Value>)` raw command batch · `Writer`/`Reader`/`Member`/`StateStore` byte-level sessions |
 | Errors | `SdkError` — `Refused` `StaleEpoch` `Sequence` `LeaseBusy` `LeaseStale` `LeaseCapacity` `Conflict` `Ambiguous` `Unavailable` `IndexBehind` `IncompatibleServer` |
 | Testing | `Transport` trait seam — inject a scripted stub for the full client stack; see `tests/domain_tests.rs` for the pattern |
-
-## Observability
-
-`client.demand_feeds()` et al. return `DemandReport` — per-resource
-`DemandRow`s (name, domain, verbatim counter fields) plus the per-domain
-rollup. Counter names are a server-owned vocabulary; `row.counter("x")`
-reads any field. `client.hot_keys()` reports dominant-Key evidence — the
-operator signal to spread or shed load, since a strictly ordered hot Key
-is never parallelized.
-
-## Error contract
-
-`SdkError` maps wire `(status, code)` to typed variants:
-`StaleEpoch` (reopen the session), `LeaseBusy`/`LeaseStale`/
-`LeaseCapacity` (subscription work fencing), `IndexBehind` (strict
-freshness unreachable in the bounded wait), `Unavailable`/`Ambiguous`/
-`Transport` (`retryable()` — retry the identical request), `Conflict`,
-`Refused`, `IncompatibleServer`, `Protocol`, `Codec`.
 
 ## Live tests
 
