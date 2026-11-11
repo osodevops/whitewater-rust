@@ -10,8 +10,8 @@ use whitewater::{Client, StateStoreSpec, Extractor};
 
 let accounts = client.create_domain("accounts").await?;
 let spec = StateStoreSpec::new("employees")?           // -> accounts.employees
-    .add_unique_key("passport", None)?      // unique: one row per value
-    .add_non_unique_key("department", None)?;  // non-unique: value -> many rows
+    .add_unique_key("passport")?      // unique: one row per value
+    .add_non_unique_key("department")?;  // non-unique: value -> many rows
 
 let store = accounts.define_state_store(spec, None).await?;   // manual store
 ```
@@ -28,8 +28,8 @@ source record to the key's values:
 
 ```rust
 let spec = StateStoreSpec::new("customers")?           // -> ops.customers
-    .add_unique_key("email", Some(Extractor::json("$.email")?))?
-    .add_non_unique_key("tier", Some(Extractor::json("$.tier")?))?;
+    .add_unique_key_with("email", Extractor::json("$.email")?)?
+    .add_non_unique_key_with("tier", Extractor::json("$.tier")?)?;
 ops.define_state_store(spec, Some("customer.changes".into())).await?;
 ```
 

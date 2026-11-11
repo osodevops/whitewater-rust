@@ -37,8 +37,8 @@ pub struct NamedKey {
 /// # async fn example(client: &Client) -> Result<(), whitewater::SdkError> {
 /// let accounts = client.domain("accounts")?;
 /// let spec = StateStoreSpec::new("employees")?     // -> accounts.employees
-///     .add_unique_key("passport", None)?
-///     .add_non_unique_key("department", None)?;
+///     .add_unique_key("passport")?
+///     .add_non_unique_key("department")?;
 /// let store = accounts.define_state_store(spec, None).await?;
 /// # Ok(())
 /// # }
@@ -96,23 +96,38 @@ impl StateStoreSpec {
     }
 
     /// Declare a **unique** named key — one value resolves to at most
-    /// one primary row (`add_key(named_key, true, extractor)`).
-    pub fn add_unique_key(
+    /// one primary row (`add_key(named_key, true, None)`). For
+    /// feed-sourced keys use [`add_unique_key_with`](Self::add_unique_key_with).
+    pub fn add_unique_key(self, named_key: impl Into<String>) -> Result<Self, SdkError> {
+        self.add_key(named_key, true, None)
+    }
+
+    /// Declare a **unique** named key with an [`Extractor`] — feed-sourced
+    /// stores only: replay projects each source-Feed record to this
+    /// key's values (`add_key(named_key, true, Some(extractor))`).
+    pub fn add_unique_key_with(
         self,
         named_key: impl Into<String>,
-        extractor: Option<Extractor>,
+        extractor: Extractor,
     ) -> Result<Self, SdkError> {
-        self.add_key(named_key, true, extractor)
+        self.add_key(named_key, true, Some(extractor))
     }
 
     /// Declare a **non-unique** named key — one value lists every
-    /// matching primary row (`add_key(named_key, false, extractor)`).
-    pub fn add_non_unique_key(
+    /// matching primary row (`add_key(named_key, false, None)`). For
+    /// feed-sourced keys use [`add_non_unique_key_with`](Self::add_non_unique_key_with).
+    pub fn add_non_unique_key(self, named_key: impl Into<String>) -> Result<Self, SdkError> {
+        self.add_key(named_key, false, None)
+    }
+
+    /// Declare a **non-unique** named key with an [`Extractor`] —
+    /// feed-sourced stores only (`add_key(named_key, false, Some(extractor))`).
+    pub fn add_non_unique_key_with(
         self,
         named_key: impl Into<String>,
-        extractor: Option<Extractor>,
+        extractor: Extractor,
     ) -> Result<Self, SdkError> {
-        self.add_key(named_key, false, extractor)
+        self.add_key(named_key, false, Some(extractor))
     }
 
     /// The declared named keys in declaration order.

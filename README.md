@@ -242,7 +242,7 @@ contract.
 | StateStores | typed `store`/`store_with` → `Store<K,V>`: `put` `put_named` `put_keys` `put_with_key` `get` `get_by` `find` `find_by` `get_or_default` `delete` `clear` `iterate` `sync` `rebuild` `view` `raw` · byte-level `state_store`/`state_store_raw` → `StateStore`: `put_row` `delete_row` `clear` `lookup` `get_by` `iterate` `sync` `rebuild` |
 | Indexes | `domain.query_index(name, IndexQuery)` → `IndexPage` · `IndexBound` `IndexQuery` `TypedValue` |
 | Pipes | `domain.define_forward_pipe` `define_enrich_pipe` `define_window_pipe` — every endpoint a `Scoped` (`Scoped::rel`/`Scoped::abs`/`Feed`/`Store`/`StateStore`/`SubscriptionRef` handles); Pipe + input Subscription stay in-domain · `domain.pipe(name)` → `describe` `pause` `resume` `drop` · `domain.pipe_infos()` (`PipeInfo`) |
-| StateStore declare | `domain.define_state_store(StateStoreSpec, source)` — `add_unique_key`/`add_non_unique_key` named keys (`Extractor` on feed-sourced) · `MAX_NAMED_KEYS` |
+| StateStore declare | `domain.define_state_store(StateStoreSpec, source)` — `add_unique_key`/`add_non_unique_key` (`*_with` + `Extractor` on feed-sourced) · `MAX_NAMED_KEYS` |
 | Observability | `demand_feeds` `demand_readers` `demand_subscriptions` `demand_indexes` `demand_pipes` → `DemandReport`/`DemandRow::counter` · `hot_keys` → `HotKey` (`feed` `share_bps` `window_records` `window_bytes`) |
 | Escape hatches | `wcl(script)` · `commands(Vec<Value>)` raw command batch · `Writer`/`Reader`/`Member`/`StateStore` byte-level sessions |
 | Errors | `SdkError` — `Refused` `StaleEpoch` `Sequence` `LeaseBusy` `LeaseStale` `LeaseCapacity` `Conflict` `Ambiguous` `Unavailable` `IndexBehind` `IncompatibleServer` |
