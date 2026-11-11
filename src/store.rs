@@ -37,8 +37,8 @@ pub struct NamedKey {
 /// # async fn example(client: &Client) -> Result<(), whitewater::SdkError> {
 /// let accounts = client.domain("accounts")?;
 /// let spec = StateStoreSpec::new("employees")?     // -> accounts.employees
-///     .add_key("passport", true, None)?
-///     .add_key("department", false, None)?;
+///     .add_unique_key("passport", None)?
+///     .add_non_unique_key("department", None)?;
 /// let store = accounts.define_state_store(spec, None).await?;
 /// # Ok(())
 /// # }
@@ -93,6 +93,26 @@ impl StateStoreSpec {
             extractor,
         });
         Ok(self)
+    }
+
+    /// Declare a **unique** named key — one value resolves to at most
+    /// one primary row (`add_key(named_key, true, extractor)`).
+    pub fn add_unique_key(
+        self,
+        named_key: impl Into<String>,
+        extractor: Option<Extractor>,
+    ) -> Result<Self, SdkError> {
+        self.add_key(named_key, true, extractor)
+    }
+
+    /// Declare a **non-unique** named key — one value lists every
+    /// matching primary row (`add_key(named_key, false, extractor)`).
+    pub fn add_non_unique_key(
+        self,
+        named_key: impl Into<String>,
+        extractor: Option<Extractor>,
+    ) -> Result<Self, SdkError> {
+        self.add_key(named_key, false, extractor)
     }
 
     /// The declared named keys in declaration order.

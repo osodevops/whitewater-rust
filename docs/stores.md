@@ -10,13 +10,13 @@ use whitewater::{Client, StateStoreSpec, Extractor};
 
 let accounts = client.create_domain("accounts").await?;
 let spec = StateStoreSpec::new("employees")?           // -> accounts.employees
-    .add_key("passport", true, None)?      // unique: one row per value
-    .add_key("department", false, None)?;  // non-unique: value -> many rows
+    .add_unique_key("passport", None)?      // unique: one row per value
+    .add_non_unique_key("department", None)?;  // non-unique: value -> many rows
 
 let store = accounts.define_state_store(spec, None).await?;   // manual store
 ```
 
-`add_key` records declaration intent used by `define_state_store` — named
+`add_unique_key`/`add_non_unique_key` record declaration intent used by `define_state_store` — named
 keys are declared at creation; at most `MAX_NAMED_KEYS` (10), unique or
 not. Adding a key to an existing store has no effect server-side.
 
@@ -28,8 +28,8 @@ source record to the key's values:
 
 ```rust
 let spec = StateStoreSpec::new("customers")?           // -> ops.customers
-    .add_key("email", true, Some(Extractor::json("$.email")?))?
-    .add_key("tier", false, Some(Extractor::json("$.tier")?))?;
+    .add_unique_key("email", Some(Extractor::json("$.email")?))?
+    .add_non_unique_key("tier", Some(Extractor::json("$.tier")?))?;
 ops.define_state_store(spec, Some("customer.changes".into())).await?;
 ```
 

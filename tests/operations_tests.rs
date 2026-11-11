@@ -299,9 +299,9 @@ async fn define_state_store_lowers_named_keys_and_source() {
     // Feed-sourced store: every named key declares an extractor.
     let spec = StateStoreSpec::new("accounts.users")
         .unwrap()
-        .add_key("passport", true, Some(Extractor::json("passport").unwrap()))
+        .add_unique_key("passport", Some(Extractor::json("passport").unwrap()))
         .unwrap()
-        .add_key("region", false, Some(Extractor::record_key()))
+        .add_non_unique_key("region", Some(Extractor::record_key()))
         .unwrap();
     client
         .domain("accounts")
@@ -334,7 +334,7 @@ async fn define_state_store_lowers_named_keys_and_source() {
     // Manual store: named keys carry no extractor.
     let spec = StateStoreSpec::new("accounts.manual")
         .unwrap()
-        .add_key("department", false, None)
+        .add_non_unique_key("department", None)
         .unwrap();
     client
         .domain("accounts")
@@ -364,7 +364,7 @@ async fn define_state_store_refuses_extractor_source_mismatches() {
     // Manual store with an extractor refuses.
     let spec = StateStoreSpec::new("s")
         .unwrap()
-        .add_key("k", false, Some(Extractor::record_key()))
+        .add_non_unique_key("k", Some(Extractor::record_key()))
         .unwrap();
     assert!(client
         .domain("ops")
@@ -376,7 +376,7 @@ async fn define_state_store_refuses_extractor_source_mismatches() {
     // Feed-sourced store missing an extractor refuses.
     let spec = StateStoreSpec::new("s")
         .unwrap()
-        .add_key("k", false, None)
+        .add_non_unique_key("k", None)
         .unwrap();
     assert!(client
         .domain("ops")
@@ -389,18 +389,37 @@ async fn define_state_store_refuses_extractor_source_mismatches() {
     assert!(StateStoreSpec::new("  ").is_err());
     assert!(StateStoreSpec::new("s")
         .unwrap()
-        .add_key(" ", false, None)
+        .add_non_unique_key(" ", None)
         .is_err());
     assert!(StateStoreSpec::new("s")
         .unwrap()
-        .add_key("dup", false, None)
+        .add_non_unique_key("dup", None)
         .unwrap()
-        .add_key("dup", false, None)
+        .add_non_unique_key("dup", None)
         .is_err());
     let spec = (0..MAX_NAMED_KEYS).fold(StateStoreSpec::new("s").unwrap(), |spec, i| {
-        spec.add_key(format!("k{i}"), false, None).unwrap()
+        spec.add_non_unique_key(format!("k{i}"), None).unwrap()
     });
-    assert!(spec.add_key("overflow", false, None).is_err());
+    assert!(spec.add_non_unique_key("overflow", None).is_err());
+
+    // The explicit helpers set the flag the WCL UNIQUE keyword encodes.
+    let flags = StateStoreSpec::new("s")
+        .unwrap()
+        .add_unique_key("passport", None)
+        .unwrap()
+        .add_non_unique_key("department", None)
+        .unwrap();
+    assert!(flags.named_keys()[0].unique);
+    assert!(!flags.named_keys()[1].unique);
+    let feed_sourced = StateStoreSpec::new("s")
+        .unwrap()
+        .add_unique_key("pp", Some(Extractor::metadata("pp").unwrap()))
+        .unwrap()
+        .add_non_unique_key("dept", Some(Extractor::json("dept").unwrap()))
+        .unwrap();
+    assert!(feed_sourced.named_keys()[0].unique);
+    assert!(feed_sourced.named_keys()[0].extractor.is_some());
+    assert!(!feed_sourced.named_keys()[1].unique);
 
     assert!(transport.seen.lock().unwrap().is_empty());
 }
@@ -504,9 +523,9 @@ async fn store_key_set_supports_all_inline_styles_and_single_string_fallback() {
     let accounts = client.domain("accounts").unwrap();
     let spec = StateStoreSpec::new("employees")
         .unwrap()
-        .add_key("passport", true, None)
+        .add_unique_key("passport", None)
         .unwrap()
-        .add_key("department", false, None)
+        .add_non_unique_key("department", None)
         .unwrap();
     accounts.define_state_store(spec, None).await.unwrap();
     let store = accounts.store("employees").unwrap();

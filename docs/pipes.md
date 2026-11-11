@@ -39,8 +39,8 @@ ops.create_subscription("orders.sub", "orders", None)
 use whitewater::{Extractor, StateStoreSpec};
 
 let spec = StateStoreSpec::new("customers")?            // -> ops.customers
-    .add_key("email", true, Some(Extractor::json("$.email")?))?
-    .add_key("tier", false, Some(Extractor::json("$.tier")?))?;
+    .add_unique_key("email", Some(Extractor::json("$.email")?))?
+    .add_non_unique_key("tier", Some(Extractor::json("$.tier")?))?;
 ops.define_state_store(spec, Some("customer.changes".into())).await?;
 ```
 
@@ -91,8 +91,8 @@ enumerable without composite row keys:
 use whitewater::{PipeOperation, WindowAggregation, WindowTime};
 
 let panes = StateStoreSpec::new("order.counts")?        // -> ops.order.counts
-    .add_key("key", false, None)?
-    .add_key("pane", false, None)?;
+    .add_non_unique_key("key", None)?
+    .add_non_unique_key("pane", None)?;
 ops.define_state_store(panes, None).await?;
 
 ops.define_window_pipe(
