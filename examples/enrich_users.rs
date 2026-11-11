@@ -168,9 +168,7 @@ async fn main() -> Result<(), SdkError> {
         let (day, week, month) = buckets(message.event_time_ns);
         for bucket in [day, week, month] {
             let current: i64 = counters.get_or_default(&bucket, 0).await?;
-            counters
-                .put(uuid::Uuid::new_v4(), &bucket, &(current + 1))
-                .await?;
+            counters.put(&bucket, &(current + 1)).await?;
         }
     }
     consumer.close().await?;

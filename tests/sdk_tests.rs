@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -351,7 +352,6 @@ async fn put_row_carries_mutation_id_and_typed_named_postings() {
     let store = crm(&client).state_store("accounts").unwrap();
     let outcome = store
         .put_row(
-            Uuid::new_v4(),
             b"acct-1",
             b"{\"tier\":\"gold\"}",
             &[(
@@ -386,11 +386,10 @@ async fn get_by_sends_typed_values_and_decodes_freshness() {
     let page = crm(&client)
         .state_store("accounts")
         .unwrap()
-        .get_by(
+        .get_by_opts(
             "region",
             &[TypedValue::Text("emea".to_owned())],
-            Some(10),
-            true,
+            &ReadOpts::new().strict().limit(10),
         )
         .await
         .unwrap();
@@ -404,6 +403,68 @@ async fn get_by_sends_typed_values_and_decodes_freshness() {
     assert_eq!(body["values"][0]["kind"], "text");
     assert_eq!(body["strict"], true);
     assert_eq!(body["limit"], 10);
+}
+
+#[tokio::test]
+async fn store_read_opts_lower_strict_wait_limit_and_after() {
+    let (client, transport) = client(vec![
+        (
+            200,
+            json!({"found": true, "key_base64": B64.encode(b"k"), "payload_base64": B64.encode(b"p"),
+                   "applied_seq": 9, "committed_seq": 9, "behind": false, "served_by": "n"}),
+        ),
+        (
+            200,
+            json!({"rows": [], "applied_seq": 9, "committed_seq": 9, "behind": false, "served_by": "n"}),
+        ),
+        (
+            200,
+            json!({"rows": [], "next_key_base64": null, "pinned_seq": 9, "served_by": "n"}),
+        ),
+    ]);
+    let store = crm(&client).state_store("accounts").unwrap();
+    store
+        .lookup_opts(b"k", &ReadOpts::new().wait(Duration::from_millis(750)))
+        .await
+        .unwrap();
+    store
+        .get_by_opts(
+            "region",
+            &[TypedValue::Text("emea".to_owned())],
+            &ReadOpts::new().strict().limit(5),
+        )
+        .await
+        .unwrap();
+    store
+        .iterate_opts(&ReadOpts::new().after(b"k0".to_vec()).limit(32))
+        .await
+        .unwrap();
+    let requests = transport.take_requests();
+    assert_eq!(requests[0].2["strict"], true);
+    assert_eq!(requests[0].2["wait_ms"], 750);
+    assert_eq!(requests[1].2["strict"], true);
+    assert_eq!(requests[1].2["limit"], 5);
+    assert!(requests[1].2.get("wait_ms").is_none());
+    assert_eq!(requests[2].2["after_key_base64"], B64.encode(b"k0"));
+    assert_eq!(requests[2].2["limit"], 32);
+}
+
+#[tokio::test]
+async fn store_with_mutation_id_reuses_the_idempotency_identity() {
+    let (client, transport) = client(vec![
+        (200, mutation_reply()),
+        (200, mutation_reply()),
+        (200, mutation_reply()),
+    ]);
+    let store = crm(&client).state_store("accounts").unwrap();
+    let scoped = store.with_mutation_id(Uuid::nil());
+    scoped.put_row(b"k", b"v", &[]).await.unwrap();
+    scoped.delete_row(b"k").await.unwrap();
+    scoped.clear().await.unwrap();
+    let requests = transport.take_requests();
+    for request in &requests {
+        assert_eq!(request.2["mutation_id"], Uuid::nil().to_string());
+    }
 }
 
 #[tokio::test]
@@ -988,7 +1049,6 @@ async fn store_put_encodes_key_and_payload_through_codecs() {
         .unwrap();
     store
         .put(
-            Uuid::new_v4(),
             &"acct-1".to_owned(),
             &Order {
                 id: "o-1".to_owned(),
@@ -1022,7 +1082,7 @@ async fn store_get_decodes_rows_and_passes_freshness_through() {
         }),
     )]);
     let store = crm(&client).store("accounts").unwrap();
-    let lookup = store.get(&"acct-1".to_owned(), true).await.unwrap();
+    let lookup = store.get_strict(&"acct-1".to_owned()).await.unwrap();
     let row = lookup.row.expect("row found");
     assert_eq!(row.key, "acct-1");
     assert_eq!(row.value, "p");
@@ -1037,7 +1097,7 @@ async fn store_get_returns_none_for_a_miss() {
         json!({"found": false, "applied_seq": 9, "committed_seq": 9}),
     )]);
     let store = crm(&client).store("accounts").unwrap();
-    let lookup = store.get(&"absent".to_owned(), false).await.unwrap();
+    let lookup = store.get(&"absent".to_owned()).await.unwrap();
     assert!(lookup.row.is_none());
 }
 
@@ -1054,7 +1114,7 @@ async fn store_iterate_decodes_rows_and_continuation_key() {
     )]);
     let store = crm(&client).store("accounts").unwrap();
     let page = store
-        .iterate(Some(&"k0".to_owned()), Some(50))
+        .iterate_opts(Some(&"k0".to_owned()), &ReadOpts::new().limit(50))
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 1);
@@ -1079,15 +1139,10 @@ async fn store_delete_clear_and_get_by_stay_typed() {
         ),
     ]);
     let store = crm(&client).store("accounts").unwrap();
-    store.delete(Uuid::new_v4(), &"k".to_owned()).await.unwrap();
-    store.clear(Uuid::new_v4()).await.unwrap();
+    store.delete(&"k".to_owned()).await.unwrap();
+    store.clear().await.unwrap();
     let page = store
-        .get_by(
-            "region",
-            &[TypedValue::Text("emea".to_owned())],
-            None,
-            false,
-        )
+        .get_by("region", &[TypedValue::Text("emea".to_owned())])
         .await
         .unwrap();
     assert_eq!(page.rows[0].key, "k");
@@ -1117,7 +1172,7 @@ async fn store_sync_and_rebuild_pass_through() {
     let store = crm(&client).store("accounts").unwrap();
     let sync = store.sync().await.unwrap();
     assert!(sync.complete);
-    let rebuild = store.rebuild(Some(Uuid::nil())).await.unwrap();
+    let rebuild = store.rebuild_with(Uuid::nil()).await.unwrap();
     assert_eq!(rebuild.applied, 4);
     assert!(!rebuild.complete);
 }

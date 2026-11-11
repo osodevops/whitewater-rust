@@ -83,8 +83,9 @@ pub use operations::{
 pub use pipe::{Pipe, PipeInfo};
 pub use reader::{AutoReader, Reader};
 pub use store::{
-    GetByPage, IteratePage, LookupOutcome, MutationOutcome, NamedKey, ReadFreshness, StateStore,
-    StateStoreSpec, StoreKeyMap, StoreKeySet, StoreRow, SyncOutcome, MAX_NAMED_KEYS,
+    GetByPage, IteratePage, LookupOutcome, MutationOutcome, MutationScope, NamedKey, ReadFreshness,
+    ReadOpts, StateStore, StateStoreSpec, StoreKeyMap, StoreKeySet, StoreRow, SyncOutcome,
+    MAX_NAMED_KEYS,
 };
 pub use transport::{
     HttpTransport, Transport, TransportBytesReply, TransportFramePageReply,

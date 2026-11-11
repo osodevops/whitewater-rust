@@ -3,6 +3,7 @@
 
 use base64::Engine;
 use serde_json::{json, Value};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::client::Client;
@@ -342,6 +343,61 @@ impl StoreKeySet for StoreKeyMap {
     }
 }
 
+/// Read options for store lookups and pages — a builder so every knob
+/// names itself at the call site:
+/// `store.get_by_opts("department", values, &ReadOpts::new().strict().limit(64))`.
+#[derive(Clone, Debug, Default)]
+pub struct ReadOpts {
+    pub(crate) strict: bool,
+    pub(crate) wait_ms: Option<u64>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) after: Option<Vec<u8>>,
+}
+
+impl ReadOpts {
+    /// Fresh options — non-strict, unbounded.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bounded-wait for the serving replica to apply its committed
+    /// frontier rather than answering stale.
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    /// Bound the strict wait — `wait_ms` applies to strict reads, so
+    /// `wait` implies [`Self::strict`].
+    pub fn wait(mut self, wait: Duration) -> Self {
+        self.strict = true;
+        self.wait_ms = Some(wait.as_millis() as u64);
+        self
+    }
+
+    /// Cap the rows a `get_by` or `iterate` page returns.
+    pub fn limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Continue an `iterate` page after a previous page's `next_key`.
+    pub fn after(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.after = Some(key.into());
+        self
+    }
+}
+
+/// A mutation-id-scoped view: every mutation carries the caller's
+/// idempotency identity so a retried sequence dedupes (and a different
+/// payload under the same id conflicts):
+/// `store.with_mutation_id(id).put_row(key, payload, named)`.
+/// The unscoped methods generate one id per call.
+pub struct MutationScope<'a, S> {
+    pub(crate) store: &'a S,
+    pub(crate) mutation_id: Uuid,
+}
+
 fn declared_default_keys() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::OnceLock::new();
@@ -370,6 +426,16 @@ impl StateStore {
         self
     }
 
+    /// Scope mutations under a caller-supplied idempotency identity —
+    /// a retried sequence dedupes, a different payload under the same
+    /// id conflicts. The unscoped methods generate one id per call.
+    pub fn with_mutation_id(&self, mutation_id: Uuid) -> MutationScope<'_, Self> {
+        MutationScope {
+            store: self,
+            mutation_id,
+        }
+    }
+
     pub(crate) fn resolve_default_key_name(&self) -> String {
         if let Some(key) = &self.default_key {
             return key.clone();
@@ -382,22 +448,23 @@ impl StateStore {
         "default".to_owned()
     }
 
-    /// Put one row with a typed [`StoreKeySet`].
+    /// Put one row with a typed [`StoreKeySet`]; the mutation id
+    /// generates per call — [`Self::with_mutation_id`] binds a stable
+    /// one for retry-safe sequences.
     pub async fn put_key_set(
         &self,
-        mutation_id: Uuid,
         key: &[u8],
         payload: &[u8],
         keys: &impl StoreKeySet,
     ) -> Result<MutationOutcome, SdkError> {
         let named = keys.to_named_postings();
-        self.put_row(mutation_id, key, payload, &named).await
+        self.put_row_with_id(Uuid::new_v4(), key, payload, &named)
+            .await
     }
 
     /// Put one row with a single default secondary-key string (mapped to the store's first declared key).
     pub async fn put_with_key(
         &self,
-        mutation_id: Uuid,
         key: &[u8],
         payload: &[u8],
         single_secondary_key: impl Into<String>,
@@ -406,12 +473,26 @@ impl StateStore {
             self.resolve_default_key_name(),
             vec![TypedValue::Text(single_secondary_key.into())],
         )];
-        self.put_row(mutation_id, key, payload, &named).await
+        self.put_row_with_id(Uuid::new_v4(), key, payload, &named)
+            .await
     }
-    /// Put one row with optional named-key postings. `mutation_id` is the
-    /// idempotency identity: an identical retry dedupes, a different
-    /// payload under the same id conflicts.
+    /// Put one row with optional named-key postings; the mutation id
+    /// generates per call — [`Self::with_mutation_id`] binds a stable
+    /// one for retry-safe sequences.
     pub async fn put_row(
+        &self,
+        key: &[u8],
+        payload: &[u8],
+        named: &[(String, Vec<TypedValue>)],
+    ) -> Result<MutationOutcome, SdkError> {
+        self.put_row_with_id(Uuid::new_v4(), key, payload, named)
+            .await
+    }
+
+    /// Put one row under an explicit mutation id — the idempotency
+    /// identity: an identical retry dedupes, a different payload under
+    /// the same id conflicts.
+    pub async fn put_row_with_id(
         &self,
         mutation_id: Uuid,
         key: &[u8],
@@ -447,8 +528,15 @@ impl StateStore {
         decode_mutation_outcome(&body)
     }
 
-    /// Delete one row by primary key under a `mutation_id` identity.
-    pub async fn delete_row(
+    /// Delete one row by primary key; the mutation id generates per
+    /// call — [`Self::with_mutation_id`] binds a stable one.
+    pub async fn delete_row(&self, key: &[u8]) -> Result<MutationOutcome, SdkError> {
+        self.delete_row_with_id(Uuid::new_v4(), key).await
+    }
+
+    /// Delete one row by primary key under an explicit `mutation_id`
+    /// idempotency identity.
+    pub async fn delete_row_with_id(
         &self,
         mutation_id: Uuid,
         key: &[u8],
@@ -471,8 +559,15 @@ impl StateStore {
         decode_mutation_outcome(&body)
     }
 
-    /// Empty the store under a `mutation_id` identity — replay dedupes.
-    pub async fn clear(&self, mutation_id: Uuid) -> Result<MutationOutcome, SdkError> {
+    /// Empty the store; the mutation id generates per call —
+    /// [`Self::with_mutation_id`] binds a stable one.
+    pub async fn clear(&self) -> Result<MutationOutcome, SdkError> {
+        self.clear_with_id(Uuid::new_v4()).await
+    }
+
+    /// Empty the store under an explicit `mutation_id` identity —
+    /// replay dedupes.
+    pub async fn clear_with_id(&self, mutation_id: Uuid) -> Result<MutationOutcome, SdkError> {
         let body = self
             .client
             .call(
@@ -487,21 +582,37 @@ impl StateStore {
         decode_mutation_outcome(&body)
     }
 
-    /// Point lookup by primary key. `strict` bounded-waits for the
-    /// replica's applied sequence to reach its committed snapshot;
-    /// unreachable freshness answers `IndexBehind`.
-    pub async fn lookup(&self, key: &[u8], strict: bool) -> Result<LookupOutcome, SdkError> {
+    /// Point lookup by primary key — non-strict. [`Self::lookup_strict`]
+    /// bounded-waits for the replica's committed snapshot; unreachable
+    /// freshness answers `IndexBehind`.
+    pub async fn lookup(&self, key: &[u8]) -> Result<LookupOutcome, SdkError> {
+        self.lookup_opts(key, &ReadOpts::new()).await
+    }
+
+    /// Point lookup that bounded-waits for the serving replica to apply
+    /// its committed frontier rather than answering stale.
+    pub async fn lookup_strict(&self, key: &[u8]) -> Result<LookupOutcome, SdkError> {
+        self.lookup_opts(key, &ReadOpts::new().strict()).await
+    }
+
+    /// The full lookup primitive — [`ReadOpts::strict`], a bounded
+    /// [`ReadOpts::wait`], or both.
+    pub async fn lookup_opts(
+        &self,
+        key: &[u8],
+        opts: &ReadOpts,
+    ) -> Result<LookupOutcome, SdkError> {
+        let mut request = json!({
+            "store": self.name,
+            "key_base64": STANDARD.encode(key),
+            "strict": opts.strict,
+        });
+        if let Some(wait_ms) = opts.wait_ms {
+            request["wait_ms"] = json!(wait_ms);
+        }
         let body = self
             .client
-            .call(
-                "POST",
-                "/v1/state-stores/lookup",
-                Some(&json!({
-                    "store": self.name,
-                    "key_base64": STANDARD.encode(key),
-                    "strict": strict,
-                })),
-            )
+            .call("POST", "/v1/state-stores/lookup", Some(&request))
             .await?;
         let row = match body.get("found").and_then(Value::as_bool) {
             Some(true) => Some(StoreRow {
@@ -522,29 +633,38 @@ impl StateStore {
         })
     }
 
-    /// Rows whose declared `named_key` posting equals one of `values`.
-    /// Bounded by `limit`; `strict` carries the same freshness contract
-    /// as `lookup`.
+    /// Rows whose declared `named_key` posting equals one of `values` —
+    /// the group/list lookup. [`Self::get_by_opts`] adds a row `limit`
+    /// and the same strict freshness contract as `lookup`.
     pub async fn get_by(
         &self,
         named_key: &str,
         values: &[TypedValue],
-        limit: Option<u64>,
-        strict: bool,
     ) -> Result<GetByPage, SdkError> {
+        self.get_by_opts(named_key, values, &ReadOpts::new()).await
+    }
+
+    /// The full `get_by` primitive — [`ReadOpts::limit`] caps the page,
+    /// [`ReadOpts::strict`]/[`ReadOpts::wait`] bound freshness.
+    pub async fn get_by_opts(
+        &self,
+        named_key: &str,
+        values: &[TypedValue],
+        opts: &ReadOpts,
+    ) -> Result<GetByPage, SdkError> {
+        let mut request = json!({
+            "store": self.name,
+            "named_key": named_key,
+            "values": values.iter().map(wire_typed).collect::<Vec<_>>(),
+            "limit": opts.limit,
+            "strict": opts.strict,
+        });
+        if let Some(wait_ms) = opts.wait_ms {
+            request["wait_ms"] = json!(wait_ms);
+        }
         let body = self
             .client
-            .call(
-                "POST",
-                "/v1/state-stores/get-by",
-                Some(&json!({
-                    "store": self.name,
-                    "named_key": named_key,
-                    "values": values.iter().map(wire_typed).collect::<Vec<_>>(),
-                    "limit": limit,
-                    "strict": strict,
-                })),
-            )
+            .call("POST", "/v1/state-stores/get-by", Some(&request))
             .await?;
         let rows = body
             .get("rows")
@@ -560,13 +680,20 @@ impl StateStore {
         })
     }
 
-    /// Primary-key ordered page; `after_key` continues from a prior
-    /// page's `next_key`, `None` starts at the first row.
-    pub async fn iterate(
-        &self,
-        after_key: Option<&[u8]>,
-        limit: Option<u64>,
-    ) -> Result<IteratePage, SdkError> {
+    /// First primary-key ordered page; [`Self::iterate_from`] continues
+    /// a prior page's `next_key`, [`Self::iterate_opts`] adds `limit`.
+    pub async fn iterate(&self) -> Result<IteratePage, SdkError> {
+        self.iterate_opts(&ReadOpts::new()).await
+    }
+
+    /// Continue iteration from a prior page's `next_key`.
+    pub async fn iterate_from(&self, after_key: &[u8]) -> Result<IteratePage, SdkError> {
+        self.iterate_opts(&ReadOpts::new().after(after_key)).await
+    }
+
+    /// The full iterate primitive — [`ReadOpts::after`] resumes a page,
+    /// [`ReadOpts::limit`] bounds it.
+    pub async fn iterate_opts(&self, opts: &ReadOpts) -> Result<IteratePage, SdkError> {
         let body = self
             .client
             .call(
@@ -574,8 +701,8 @@ impl StateStore {
                 "/v1/state-stores/iterate",
                 Some(&json!({
                     "store": self.name,
-                    "after_key_base64": after_key.map(|key| STANDARD.encode(key)),
-                    "limit": limit,
+                    "after_key_base64": opts.after.as_ref().map(|key| STANDARD.encode(key)),
+                    "limit": opts.limit,
                 })),
             )
             .await?;
@@ -617,9 +744,19 @@ impl StateStore {
         Ok(decode_sync_outcome(&body))
     }
 
-    /// Rebuild a feed-sourced store from retained history; `token` is the
-    /// caller's retry identity for the pass.
-    pub async fn rebuild(&self, token: Option<Uuid>) -> Result<SyncOutcome, SdkError> {
+    /// Rebuild a feed-sourced store from retained history.
+    /// [`Self::rebuild_with`] carries a caller retry token for the pass.
+    pub async fn rebuild(&self) -> Result<SyncOutcome, SdkError> {
+        self.rebuild_body(None).await
+    }
+
+    /// Rebuild with an explicit retry `token` — the same token marks a
+    /// resumed pass.
+    pub async fn rebuild_with(&self, token: Uuid) -> Result<SyncOutcome, SdkError> {
+        self.rebuild_body(Some(token)).await
+    }
+
+    async fn rebuild_body(&self, token: Option<Uuid>) -> Result<SyncOutcome, SdkError> {
         let body = self
             .client
             .call(
@@ -632,5 +769,56 @@ impl StateStore {
             )
             .await?;
         Ok(decode_sync_outcome(&body))
+    }
+}
+
+impl<'a> MutationScope<'a, StateStore> {
+    /// Put one row under the scope's idempotency identity.
+    pub async fn put_row(
+        &self,
+        key: &[u8],
+        payload: &[u8],
+        named: &[(String, Vec<TypedValue>)],
+    ) -> Result<MutationOutcome, SdkError> {
+        self.store
+            .put_row_with_id(self.mutation_id, key, payload, named)
+            .await
+    }
+
+    /// Put one row with a typed [`StoreKeySet`] under the scope's
+    /// idempotency identity.
+    pub async fn put_key_set(
+        &self,
+        key: &[u8],
+        payload: &[u8],
+        keys: &impl StoreKeySet,
+    ) -> Result<MutationOutcome, SdkError> {
+        let named = keys.to_named_postings();
+        self.put_row(key, payload, &named).await
+    }
+
+    /// Put one row with a single default secondary-key string under the
+    /// scope's idempotency identity.
+    pub async fn put_with_key(
+        &self,
+        key: &[u8],
+        payload: &[u8],
+        single_secondary_key: impl Into<String>,
+    ) -> Result<MutationOutcome, SdkError> {
+        let named = vec![(
+            self.store.resolve_default_key_name(),
+            vec![TypedValue::Text(single_secondary_key.into())],
+        )];
+        self.put_row(key, payload, &named).await
+    }
+
+    /// Delete one row under the scope's idempotency identity.
+    pub async fn delete_row(&self, key: &[u8]) -> Result<MutationOutcome, SdkError> {
+        self.store.delete_row_with_id(self.mutation_id, key).await
+    }
+
+    /// Empty the store under the scope's idempotency identity.
+    pub async fn clear(&self) -> Result<MutationOutcome, SdkError> {
+        self.store.clear_with_id(self.mutation_id).await
     }
 }

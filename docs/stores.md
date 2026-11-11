@@ -50,7 +50,6 @@ Wrap `StoreKeyMap` in a typed struct implementing `StoreKeySet` (or use `StoreKe
 
 ```rust
 use whitewater::{StoreKeyMap, StoreKeySet, TypedValue};
-use uuid::Uuid;
 
 #[derive(Clone, Default)]
 pub struct PassportKeySet(StoreKeyMap);
@@ -79,20 +78,21 @@ impl StoreKeySet for PassportKeySet {
 }
 
 let typed_store = accounts.store("employees")?;
-typed_store.put_keys(Uuid::new_v4(), &"emp-1".into(), &profile, &PassportKeySet::with("P123", "eng")).await?;
-typed_store.put_keys(Uuid::new_v4(), &"emp-2".into(), &profile, &PassportKeySet::with_passport("P222").department("ops")).await?;
-typed_store.put_with_key(Uuid::new_v4(), &"emp-3".into(), &profile, "P333").await?;
+typed_store.put_keys(&"emp-1".into(), &profile, &PassportKeySet::with("P123", "eng")).await?;
+typed_store.put_keys(&"emp-2".into(), &profile, &PassportKeySet::with_passport("P222").department("ops")).await?;
+typed_store.put_with_key(&"emp-3".into(), &profile, "P333").await?;
+
+// Or scope a stable idempotency identity over a retry sequence:
+typed_store.with_mutation_id(batch_id).put_keys(&"emp-4".into(), &profile, &ks).await?;
 ```
 
 Or on the byte-level `StateStore`:
 
 ```rust
 use whitewater::TypedValue;
-use uuid::Uuid;
 
 store
     .put_row(
-        Uuid::new_v4(),                    // mutation_id: idempotency identity
         b"user-1",
         b"profile-1",
         &[
@@ -101,8 +101,12 @@ store
         ],
     )
     .await?;
-store.delete_row(Uuid::new_v4(), b"user-1").await?;
-store.clear(Uuid::new_v4()).await?;
+store.delete_row(b"user-1").await?;
+store.clear().await?;
+
+// Mutations auto-generate their idempotency identity; bind a stable one
+// over a retry sequence via `with_mutation_id(id)`:
+store.with_mutation_id(retry_id).put_row(b"user-1", b"profile-1", &named).await?;
 ```
 
 - `put_row` commits one journaled `put_row` through the store's RF3
@@ -113,41 +117,42 @@ store.clear(Uuid::new_v4()).await?;
 - Named values must match the store's declared keys — the server refuses
   undeclared names. `unique` claims arbitrate first-committed-wins by
   journal order.
-- `mutation_id` is the idempotency identity: retry a timed-out put with
-  the same id and it dedupes; reuse it with different contents and it
-  conflicts.
+- Mutations generate their idempotency identity per call; bind a stable
+  one via `with_mutation_id(id)` (retry dedupes, different contents
+  conflict) or the `put_row_with_id`/`delete_row_with_id`/`clear_with_id`
+  primitives.
 
 ## Reading
 
 ```rust
-let outcome = store.lookup(b"user-1", false).await?;
+let outcome = store.lookup(b"user-1").await?;
 if let Some(row) = outcome.row {
     // row.key / row.payload are bytes
 }
 // outcome.freshness: applied_seq / committed_seq / behind / served_by
 
 let page = store
-    .get_by("department", &[TypedValue::Text("eng".to_owned())], Some(100), false)
+    .get_by("department", &[TypedValue::Text("eng".to_owned())])
     .await?;
+// tune: get_by_opts(name, values, &ReadOpts::new().strict().limit(100))
 // page.rows — every matching (key, payload) pair
 // page.freshness.served_by — which Node answered
 ```
 
-`get_by(named_key, values, limit, strict)` is the group/list lookup: one
-non-unique named value resolves to **every** primary row carrying it.
-Pass `strict = true` on `lookup`/`get_by` and the serving replica
-bounded-waits for its applied journal to reach the committed frontier
-rather than answering stale; non-strict reads still report
-`freshness.behind` honestly.
+`get_by` is the group/list lookup: one non-unique named value resolves
+to **every** primary row carrying it. `lookup_strict` / the
+`ReadOpts::strict().wait(d)` options bounded-wait for the replica's
+applied journal to reach the committed frontier rather than answering
+stale; non-strict reads still report `freshness.behind` honestly.
 
 ## Iterating
 
 ```rust
-let page = store.iterate(None, Some(256)).await?;
+let page = store.iterate_opts(&ReadOpts::new().limit(256)).await?;
 for row in &page.rows { /* primary-key order */ }
 let next = page.next_key.as_deref();    // continuation, or None at end
 // page.pinned_seq — journal position the page was pinned to
-let page2 = store.iterate(next, Some(256)).await?;
+let page2 = store.iterate_from(next.unwrap()).await?;
 ```
 
 `iterate` pages `/v1/state-stores/iterate` — the same bounded, ordered
@@ -164,17 +169,16 @@ one-value conveniences over `put_row`/`lookup`/`get_by`:
 let typed = accounts.store::<String, String>("employees")?;
 typed
     .put_named(
-        Uuid::new_v4(),
         &"user-1".to_owned(),
         &"profile-1".to_owned(),
         &[("department".to_owned(), vec![TypedValue::Text("eng".to_owned())])],
     )
     .await?;
-let row = typed.get(&"user-1".to_owned(), false).await?;
+let row = typed.get(&"user-1".to_owned()).await?;
 let hits = typed
-    .get_by("department", &[TypedValue::Text("eng".to_owned())], None, false)
+    .get_by("department", &[TypedValue::Text("eng".to_owned())])
     .await?;
-let iter = typed.iterate(None, Some(256)).await?;   // decoded keys too
+let iter = typed.iterate_opts(None, &ReadOpts::new().limit(256)).await?;   // decoded keys too
 ```
 
 `store.view(other_key_codec, other_value_codec)` rebinds the same store

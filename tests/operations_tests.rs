@@ -533,8 +533,8 @@ async fn store_key_set_supports_all_inline_styles_and_single_string_fallback() {
 
     // 1A: Static factory PassportKeySet::with("P123", "eng")
     store
+        .with_mutation_id(id)
         .put_keys(
-            id,
             &"emp-1".to_owned(),
             &"alice".to_owned(),
             &PassportKeySet::with("P123", "eng"),
@@ -543,8 +543,8 @@ async fn store_key_set_supports_all_inline_styles_and_single_string_fallback() {
         .unwrap();
     // 1B: Static starter + fluent chaining
     store
+        .with_mutation_id(id)
         .put_keys(
-            id,
             &"emp-2".to_owned(),
             &"bob".to_owned(),
             &PassportKeySet::with_passport("P222").department("ops"),
@@ -553,8 +553,8 @@ async fn store_key_set_supports_all_inline_styles_and_single_string_fallback() {
         .unwrap();
     // 2: Closure / builder block
     store
+        .with_mutation_id(id)
         .put_keys(
-            id,
             &"emp-3".to_owned(),
             &"cara".to_owned(),
             &PassportKeySet::of(|k| {
@@ -565,7 +565,8 @@ async fn store_key_set_supports_all_inline_styles_and_single_string_fallback() {
         .unwrap();
     // 3: Single default string fallback -> maps to first declared key ("passport")
     store
-        .put_with_key(id, &"emp-4".to_owned(), &"dan".to_owned(), "P444")
+        .with_mutation_id(id)
+        .put_with_key(&"emp-4".to_owned(), &"dan".to_owned(), "P444")
         .await
         .unwrap();
 
