@@ -229,13 +229,150 @@ fn decode_sync_outcome(body: &Value) -> SyncOutcome {
 /// `put_row`/`delete_row`/`clear` under caller `mutation_id`s (identical
 /// retries dedupe); feed-sourced stores refuse mutation server-side and
 /// are maintained by `sync`/`rebuild`.
+/// Strongly-typed or inline secondary-key postings for a [`StateStore`]
+/// or [`crate::Store`] mutation. Wrap [`StoreKeyMap`] inside a domain
+/// struct to give your store typed fluent builders and `with(...)`
+/// constructors.
+pub trait StoreKeySet {
+    /// Lower this key set into the `(name, values)` pairs carried on the wire.
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)>;
+}
+
+impl<T: StoreKeySet + ?Sized> StoreKeySet for &T {
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)> {
+        (**self).to_named_postings()
+    }
+}
+
+impl StoreKeySet for [(String, Vec<TypedValue>)] {
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)> {
+        self.to_vec()
+    }
+}
+
+impl StoreKeySet for Vec<(String, Vec<TypedValue>)> {
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)> {
+        self.clone()
+    }
+}
+
+/// Composable base map for typed [`StoreKeySet`] implementations.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoreKeyMap {
+    keys: Vec<(String, Vec<TypedValue>)>,
+}
+
+impl StoreKeyMap {
+    pub fn new() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    pub fn of(builder: impl FnOnce(&mut Self)) -> Self {
+        let mut ks = Self::new();
+        builder(&mut ks);
+        ks
+    }
+
+    pub fn put(mut self, name: impl Into<String>, value: impl Into<TypedValue>) -> Self {
+        self.set(name, value);
+        self
+    }
+
+    pub fn set(&mut self, name: impl Into<String>, value: impl Into<TypedValue>) -> &mut Self {
+        let name = name.into();
+        let value = value.into();
+        if let Some((_, existing)) = self.keys.iter_mut().find(|(k, _)| k == &name) {
+            *existing = vec![value];
+        } else {
+            self.keys.push((name, vec![value]));
+        }
+        self
+    }
+
+    pub fn get(&self, name: &str) -> Option<&[TypedValue]> {
+        self.keys
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+impl StoreKeySet for StoreKeyMap {
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)> {
+        self.keys.clone()
+    }
+}
+
+fn declared_default_keys() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn register_default_key(store_name: &str, default_key: &str) {
+    if !store_name.trim().is_empty() && !default_key.trim().is_empty() {
+        if let Ok(mut guard) = declared_default_keys().lock() {
+            guard.insert(store_name.to_owned(), default_key.to_owned());
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     pub(crate) client: Client,
     pub(crate) name: String,
+    pub(crate) default_key: Option<String>,
 }
 
 impl StateStore {
+    /// Bind the default secondary-key name used by [`Self::put_with_key`].
+    pub fn with_default_key(mut self, default_key: impl Into<String>) -> Self {
+        self.default_key = Some(default_key.into());
+        self
+    }
+
+    pub(crate) fn resolve_default_key_name(&self) -> String {
+        if let Some(key) = &self.default_key {
+            return key.clone();
+        }
+        if let Ok(guard) = declared_default_keys().lock() {
+            if let Some(key) = guard.get(&self.name) {
+                return key.clone();
+            }
+        }
+        "default".to_owned()
+    }
+
+    /// Put one row with a typed [`StoreKeySet`].
+    pub async fn put_key_set(
+        &self,
+        mutation_id: Uuid,
+        key: &[u8],
+        payload: &[u8],
+        keys: &impl StoreKeySet,
+    ) -> Result<MutationOutcome, SdkError> {
+        let named = keys.to_named_postings();
+        self.put_row(mutation_id, key, payload, &named).await
+    }
+
+    /// Put one row with a single default secondary-key string (mapped to the store's first declared key).
+    pub async fn put_with_key(
+        &self,
+        mutation_id: Uuid,
+        key: &[u8],
+        payload: &[u8],
+        single_secondary_key: impl Into<String>,
+    ) -> Result<MutationOutcome, SdkError> {
+        let named = vec![(
+            self.resolve_default_key_name(),
+            vec![TypedValue::Text(single_secondary_key.into())],
+        )];
+        self.put_row(mutation_id, key, payload, &named).await
+    }
     /// Put one row with optional named-key postings. `mutation_id` is the
     /// idempotency identity: an identical retry dedupes, a different
     /// payload under the same id conflicts.

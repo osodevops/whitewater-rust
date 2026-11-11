@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::codec::Codec;
 use crate::error::SdkError;
-use crate::store::{MutationOutcome, ReadFreshness, StateStore, SyncOutcome};
+use crate::store::{MutationOutcome, ReadFreshness, StateStore, StoreKeySet, SyncOutcome};
 use crate::typed::TypedValue;
 
 /// One decoded row.
@@ -84,6 +84,39 @@ impl<K, V> Store<K, V> {
         value: &V,
     ) -> Result<MutationOutcome, SdkError> {
         self.put_named(mutation_id, key, value, &[]).await
+    }
+
+    /// Bind the default secondary-key name used by [`Self::put_with_key`].
+    pub fn with_default_key(mut self, default_key: impl Into<String>) -> Self {
+        self.inner = self.inner.with_default_key(default_key);
+        self
+    }
+
+    /// Put one row plus a typed [`StoreKeySet`].
+    pub async fn put_keys(
+        &self,
+        mutation_id: Uuid,
+        key: &K,
+        value: &V,
+        keys: &impl StoreKeySet,
+    ) -> Result<MutationOutcome, SdkError> {
+        let named = keys.to_named_postings();
+        self.put_named(mutation_id, key, value, &named).await
+    }
+
+    /// Put one row with a single default secondary-key string (mapped to the store's first declared key).
+    pub async fn put_with_key(
+        &self,
+        mutation_id: Uuid,
+        key: &K,
+        value: &V,
+        single_secondary_key: impl Into<String>,
+    ) -> Result<MutationOutcome, SdkError> {
+        let named = vec![(
+            self.inner.resolve_default_key_name(),
+            vec![TypedValue::Text(single_secondary_key.into())],
+        )];
+        self.put_named(mutation_id, key, value, &named).await
     }
 
     /// Put one row plus named-key postings for `get_by` queries.

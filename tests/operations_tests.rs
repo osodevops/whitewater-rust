@@ -32,7 +32,12 @@ impl Transport for CaptureTransport {
             .push(body.cloned().unwrap_or(Value::Null));
         Ok(TransportReply {
             status: 200,
-            body: json!({ "results": [{ "status": "ok", "data": {} }] }),
+            body: json!({
+                "store_id": "00000000-0000-7000-8000-000000000007",
+                "sequence": 4,
+                "deduplicated": false,
+                "results": [{ "status": "ok", "data": {} }]
+            }),
         })
     }
 }
@@ -449,4 +454,126 @@ async fn extractor_wire_shapes_match_the_field_spec_contract() {
     assert!(Extractor::json("").is_err());
     assert!(Extractor::metadata("x".repeat(257)).is_err());
     assert!(Extractor::json("x".repeat(513)).is_err());
+}
+
+#[derive(Clone, Debug, Default)]
+struct PassportKeySet(StoreKeyMap);
+
+impl PassportKeySet {
+    fn new() -> Self {
+        Self(StoreKeyMap::new())
+    }
+
+    fn passport(mut self, v: impl Into<String>) -> Self {
+        self.0.set("passport", v.into());
+        self
+    }
+
+    fn department(mut self, v: impl Into<String>) -> Self {
+        self.0.set("department", v.into());
+        self
+    }
+
+    fn with(passport: impl Into<String>, department: impl Into<String>) -> Self {
+        Self::new().passport(passport).department(department)
+    }
+
+    fn with_passport(passport: impl Into<String>) -> Self {
+        Self::new().passport(passport)
+    }
+
+    fn of(builder: impl FnOnce(&mut Self)) -> Self {
+        let mut ks = Self::new();
+        builder(&mut ks);
+        ks
+    }
+}
+
+impl StoreKeySet for PassportKeySet {
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)> {
+        self.0.to_named_postings()
+    }
+}
+
+#[tokio::test]
+async fn store_key_set_supports_all_inline_styles_and_single_string_fallback() {
+    let transport = Arc::new(CaptureTransport {
+        seen: Mutex::new(Vec::new()),
+    });
+    let client = client(transport.clone());
+    let accounts = client.domain("accounts").unwrap();
+    let spec = StateStoreSpec::new("employees")
+        .unwrap()
+        .add_key("passport", true, None)
+        .unwrap()
+        .add_key("department", false, None)
+        .unwrap();
+    accounts.define_state_store(spec, None).await.unwrap();
+    let store = accounts.store("employees").unwrap();
+    let id = uuid::Uuid::nil();
+
+    // 1A: Static factory PassportKeySet::with("P123", "eng")
+    store
+        .put_keys(
+            id,
+            &"emp-1".to_owned(),
+            &"alice".to_owned(),
+            &PassportKeySet::with("P123", "eng"),
+        )
+        .await
+        .unwrap();
+    // 1B: Static starter + fluent chaining
+    store
+        .put_keys(
+            id,
+            &"emp-2".to_owned(),
+            &"bob".to_owned(),
+            &PassportKeySet::with_passport("P222").department("ops"),
+        )
+        .await
+        .unwrap();
+    // 2: Closure / builder block
+    store
+        .put_keys(
+            id,
+            &"emp-3".to_owned(),
+            &"cara".to_owned(),
+            &PassportKeySet::of(|k| {
+                *k = k.clone().passport("P333").department("eng");
+            }),
+        )
+        .await
+        .unwrap();
+    // 3: Single default string fallback -> maps to first declared key ("passport")
+    store
+        .put_with_key(id, &"emp-4".to_owned(), &"dan".to_owned(), "P444")
+        .await
+        .unwrap();
+
+    let seen = transport.seen.lock().unwrap();
+    assert_eq!(
+        seen[1]["op"]["named"],
+        json!([
+            { "name": "passport", "values": [{ "kind": "text", "value": "P123" }] },
+            { "name": "department", "values": [{ "kind": "text", "value": "eng" }] }
+        ])
+    );
+    assert_eq!(
+        seen[2]["op"]["named"],
+        json!([
+            { "name": "passport", "values": [{ "kind": "text", "value": "P222" }] },
+            { "name": "department", "values": [{ "kind": "text", "value": "ops" }] }
+        ])
+    );
+    assert_eq!(
+        seen[3]["op"]["named"],
+        json!([
+            { "name": "passport", "values": [{ "kind": "text", "value": "P333" }] },
+            { "name": "department", "values": [{ "kind": "text", "value": "eng" }] }
+        ])
+    );
+    assert_eq!(
+        seen[4]["op"]["named"],
+        json!([{ "name": "passport", "values": [{ "kind": "text", "value": "P444" }] }])
+    );
 }

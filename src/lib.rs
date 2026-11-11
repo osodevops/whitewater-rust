@@ -84,7 +84,7 @@ pub use pipe::{Pipe, PipeInfo};
 pub use reader::{AutoReader, Reader};
 pub use store::{
     GetByPage, IteratePage, LookupOutcome, MutationOutcome, NamedKey, ReadFreshness, StateStore,
-    StateStoreSpec, StoreRow, SyncOutcome, MAX_NAMED_KEYS,
+    StateStoreSpec, StoreKeyMap, StoreKeySet, StoreRow, SyncOutcome, MAX_NAMED_KEYS,
 };
 pub use transport::{
     HttpTransport, Transport, TransportBytesReply, TransportFramePageReply,

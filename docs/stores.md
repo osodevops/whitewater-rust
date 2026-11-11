@@ -44,7 +44,47 @@ Extractor::json("$.profile.id")? // a dotted JSON-path over the payload
 A manual store refuses extractors (values arrive on each `put_row`);
 a feed-sourced store refuses named keys without them.
 
-## Writing
+## Writing & `StoreKeySet`
+
+Wrap `StoreKeyMap` in a typed struct implementing `StoreKeySet` (or use `StoreKeyMap::new()` / `put_with_key` directly):
+
+```rust
+use whitewater::{StoreKeyMap, StoreKeySet, TypedValue};
+use uuid::Uuid;
+
+#[derive(Clone, Default)]
+pub struct PassportKeySet(StoreKeyMap);
+
+impl PassportKeySet {
+    pub fn passport(mut self, v: impl Into<String>) -> Self {
+        self.0.set("passport", v.into());
+        self
+    }
+    pub fn department(mut self, v: impl Into<String>) -> Self {
+        self.0.set("department", v.into());
+        self
+    }
+    pub fn with(passport: impl Into<String>, department: impl Into<String>) -> Self {
+        Self::default().passport(passport).department(department)
+    }
+    pub fn with_passport(passport: impl Into<String>) -> Self {
+        Self::default().passport(passport)
+    }
+}
+
+impl StoreKeySet for PassportKeySet {
+    fn to_named_postings(&self) -> Vec<(String, Vec<TypedValue>)> {
+        self.0.to_named_postings()
+    }
+}
+
+let typed_store = accounts.store("employees")?;
+typed_store.put_keys(Uuid::new_v4(), &"emp-1".into(), &profile, &PassportKeySet::with("P123", "eng")).await?;
+typed_store.put_keys(Uuid::new_v4(), &"emp-2".into(), &profile, &PassportKeySet::with_passport("P222").department("ops")).await?;
+typed_store.put_with_key(Uuid::new_v4(), &"emp-3".into(), &profile, "P333").await?;
+```
+
+Or on the byte-level `StateStore`:
 
 ```rust
 use whitewater::TypedValue;

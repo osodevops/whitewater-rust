@@ -603,6 +603,7 @@ impl Client {
         StateStore {
             client: self.clone(),
             name: name.to_owned(),
+            default_key: None,
         }
     }
 
@@ -953,6 +954,9 @@ impl Client {
                 .collect::<Vec<_>>(),
         })])
         .await?;
+        if let Some(first) = spec.named_keys().first() {
+            crate::store::register_default_key(spec.name(), &first.name);
+        }
         Ok(self.state_store(spec.name()))
     }
 

@@ -183,3 +183,33 @@ pub(crate) fn decode_index_page(body: &Value) -> Result<IndexPage, SdkError> {
             .to_owned(),
     })
 }
+
+impl From<&str> for TypedValue {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned())
+    }
+}
+
+impl From<String> for TypedValue {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<i64> for TypedValue {
+    fn from(value: i64) -> Self {
+        Self::I64(value)
+    }
+}
+
+impl From<bool> for TypedValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
+impl From<Vec<u8>> for TypedValue {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Bytes(value)
+    }
+}
